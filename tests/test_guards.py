@@ -141,6 +141,37 @@ def test_mixed_fraction_value():
     assert (t.value, t.decimals) == (4.25, 2)
 
 
+# ---- unrecognized letter suffixes (scale=1, must match exactly) -------------
+
+
+@pytest.mark.parametrize(
+    ("text", "facts", "ok"),
+    [
+        ("It grew 5m.", [5], True),
+        ("It grew 5m.", [5_000_000], False),
+        ("It grew 5m.", [6], False),
+        ("Up 3x from last year.", [3], True),
+        ("Up 3x from last year.", [4], False),
+    ],
+)
+def test_unrecognized_letter_suffix_requires_exact_match(text, facts, ok):
+    assert verify_numbers(text, facts).ok is ok
+
+
+def test_unrecognized_suffix_token_has_scale_one():
+    (t5,) = extract_numbers("5m")
+    (t3,) = extract_numbers("3x")
+    assert (t5.value, t5.decimals, t5.scale, t5.unit) == (5.0, 0, 1.0, None)
+    assert (t3.value, t3.decimals, t3.scale, t3.unit) == (3.0, 0, 1.0, None)
+
+
+def test_known_scale_and_unit_suffixes_still_take_priority_over_unk():
+    (t,) = extract_numbers("142K")
+    assert (t.scale, t.unit) == (1e3, None)
+    (t,) = extract_numbers("25bp")
+    assert (t.scale, t.unit) == (1.0, "bp")
+
+
 # ---- facts ------------------------------------------------------------------
 
 

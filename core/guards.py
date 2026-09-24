@@ -13,6 +13,10 @@ where d is the token's decimal places and s is 1 or the token's scale adjustment
 basis-point tokens also match a fact x100 (0.987 -> "98.7%", 0.25 pp -> "25 bp"). A tie
 at the rounding boundary is accepted either way, since Python formatting rounds half-even.
 
+K/M/B are the only scale suffixes. A number followed by any other letter run glued to
+it ("5m", "3x") is still a token, but with scale 1: it must match a fact exactly at its
+own precision, the letters carry no meaning.
+
 Ignored: years 1900-2100, day numbers after a month name, numeric dates, clock times,
 ordinals, fixed terms (2-year, 3-month, 52-week, Q1-Q4, 401(k), P0-P3), version strings,
 and anything passed in `allow`.
@@ -65,10 +69,11 @@ _TOKEN = re.compile(
     (?:\.(?P<dec>\d+))?
     (?:-(?P<fnum>\d+)/(?P<fden>\d+))?          # mixed fraction: 4-1/4
     (?:
-        (?P<suffix>(?-i:[KkMBT]))(?![A-Za-z])  # 142K, $1.2M, $4.2B (case-sensitive)
-      | \s?(?P<word>thousand|million|billion|trillion)\b
+        (?P<suffix>(?-i:[KkMB]))(?![A-Za-z])   # 142K, $1.2M, $4.2B (case-sensitive)
+      | \s?(?P<word>thousand|million|billion)\b
     )?
     (?:\s?(?P<unit>%|percentage\s+points?\b|percent\b|pp\b|bps?\b|basis\s+points?\b))?
+    (?P<unk>[A-Za-z]+)?                        # unrecognized suffix, glued: scale=1
     (?![\w])
     """,
     re.VERBOSE | re.IGNORECASE,
@@ -78,11 +83,9 @@ _SCALES = {
     "k": 1e3,
     "m": 1e6,
     "b": 1e9,
-    "t": 1e12,
     "thousand": 1e3,
     "million": 1e6,
     "billion": 1e9,
-    "trillion": 1e12,
 }
 
 
@@ -170,7 +173,7 @@ def extract_numbers(text: str, *, allow: Iterable[str] = ()) -> list[NumberToken
         int_part = m["int"].replace(",", "")
         suffix = (m["suffix"] or m["word"] or "").lower()
         unit = _unit(m["unit"])
-        plain = not (m["cur"] or m["dec"] or m["fnum"] or suffix or unit or m["sign"])
+        plain = not (m["cur"] or m["dec"] or m["fnum"] or suffix or unit or m["sign"] or m["unk"])
         if plain and "," not in m["int"] and len(int_part) == 4 and 1900 <= int(int_part) <= 2100:
             continue  # a year
         if m["fnum"]:

@@ -21,11 +21,15 @@ agents-hub/
 │   ├── business_profile.toml   # NAICS codes, keywords, set-asides (grants)
 │   └── repos.toml              # repos the maintenance agent watches
 ├── core/
+│   ├── agent.py                # Agent base class, AgentResult, RunContext (the agent contract)
+│   ├── registry.py             # known agent IDs; loads agents/<id>/agent.py:AGENT
 │   ├── llm.py                  # the ONLY place the Anthropic SDK is imported
-│   ├── http.py                 # retries, rate limiting, on-disk cache
-│   ├── schema.py               # shared pydantic models (RunMeta, Citation, etc.)
-│   ├── publish.py              # writes site data files + trims history
-│   ├── costs.py                # token/$ logging and per-run budget cap
+│   ├── http.py                 # retries, rate limiting, request budgets, on-disk cache
+│   ├── schema.py               # shared pydantic models (RunMeta, Citation, Manifest, etc.)
+│   ├── publish.py              # writes site data files, manifest, trims history
+│   ├── costs.py                # token/$ logging, per-run budget cap, cost summary
+│   ├── settings.py             # paths, env vars, config/*.toml loading
+│   ├── export_schemas.py       # pydantic → schemas/*.schema.json for the site
 │   └── runner.py               # `python -m core.runner <agent>` entry point
 ├── agents/
 │   ├── real_estate/            # fetch.py, transform.py, analyze.py, schema.py
@@ -93,9 +97,21 @@ uv run python -m core.runner <agent>      # run one agent (writes to site/public
 uv run python -m core.runner <agent> --dry-run   # fetch + transform, skip LLM + publish
 uv run pytest                             # tests
 uv run python -m evals.run <agent>        # evals
+uv run python -m core.export_schemas      # regenerate schemas/ after changing an output model
 cd site && npm run dev                    # local site
 cd site && npm run build                  # static export to site/out
 ```
+
+## Building an agent on core
+
+- Create `agents/<id>/agent.py` with a subclass of `core.agent.Agent` and a module-level `AGENT = MyAgent()`. The ID must already be in `core.registry.AGENT_IDS`.
+- Set the class attributes: `name`, `route`, `schema_version`, `expected_interval_hours`, `next_run_hint`, `history_keep` (52 weekly / 90 daily), and `output_model` (a subclass of `core.schema.AgentOutput`, which already carries `meta`).
+- Implement `fetch(ctx)` with `ctx.http` only, `transform(ctx, raw)` as pure Python with no LLM, and `analyze(ctx, data)` with `ctx.llm.complete / .structured / .batch`. Return an `AgentResult`: `body` is every field except `meta` (the runner builds `meta`), and `files` holds extra JSON such as `metros/<slug>.json`.
+- Build `headline` and `key_stats` in code. Set `data_changed=False` and reuse `ctx.previous_latest()` narrative when the sources haven't changed.
+- Rate limits and daily request caps go in `configure_http(http)`, e.g. `http.set_policy("api.sam.gov", HostPolicy(daily_budget=10))`.
+- Put stable instructions in `system=` / `context=` (they're cached) and per-run numbers in the prompt.
+- Put nested published models on `core.schema.Model` (it forbids extra fields) and timestamps on `core.schema.Timestamp`. List files other than `latest.json` in `extra_models()` so their schemas get exported.
+- Never write files and never import `anthropic` from an agent.
 
 ## Website
 

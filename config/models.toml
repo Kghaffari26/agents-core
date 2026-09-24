@@ -1,0 +1,37 @@
+# Model tiers used by core/llm.py. Agents ask for a tier, never a model ID.
+# Verify IDs and prices at https://docs.claude.com before changing them.
+
+[tiers.fast]
+# Extraction, classification, bulk scoring.
+model = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[tiers.smart]
+# Final narrative synthesis only.
+model = "claude-sonnet-5"
+max_tokens = 8000
+# Sonnet 5 runs adaptive thinking by default; effort bounds how much it spends.
+effort = "medium"
+
+# USD per million tokens. cache_write is the 5-minute TTL rate (1.25x input).
+# Batch requests are billed at batch_discount x these rates.
+[pricing]
+batch_discount = 0.5
+
+[pricing.models."claude-haiku-4-5-20251001"]
+input = 1.00
+output = 5.00
+cache_write = 1.25
+cache_read = 0.10
+
+[pricing.models."claude-haiku-4-5"]
+input = 1.00
+output = 5.00
+cache_write = 1.25
+cache_read = 0.10
+
+[pricing.models."claude-sonnet-5"]
+input = 2.00
+output = 10.00
+cache_write = 2.50
+cache_read = 0.20

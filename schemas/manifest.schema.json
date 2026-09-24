@@ -1,0 +1,215 @@
+{
+  "$defs": {
+    "KeyStat": {
+      "additionalProperties": false,
+      "properties": {
+        "delta": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta"
+        },
+        "delta_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "currency_compact",
+                "currency",
+                "percent",
+                "percent_signed",
+                "pp_signed",
+                "count",
+                "count_signed",
+                "count_signed_thousands",
+                "decimal1",
+                "days",
+                "ratio"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta Format"
+        },
+        "format": {
+          "enum": [
+            "currency_compact",
+            "currency",
+            "percent",
+            "percent_signed",
+            "pp_signed",
+            "count",
+            "count_signed",
+            "count_signed_thousands",
+            "decimal1",
+            "days",
+            "ratio"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "good_direction": {
+          "default": "neutral",
+          "enum": [
+            "up",
+            "down",
+            "neutral"
+          ],
+          "title": "Good Direction",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "label",
+        "value",
+        "format",
+        "delta",
+        "delta_format",
+        "good_direction"
+      ],
+      "title": "KeyStat",
+      "type": "object"
+    },
+    "ManifestEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_interval_hours": {
+          "exclusiveMinimum": 0,
+          "title": "Expected Interval Hours",
+          "type": "integer"
+        },
+        "headline": {
+          "title": "Headline",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "items_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Items Count"
+        },
+        "key_stats": {
+          "items": {
+            "$ref": "#/$defs/KeyStat"
+          },
+          "maxItems": 4,
+          "title": "Key Stats",
+          "type": "array"
+        },
+        "last_data_change_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Data Change At"
+        },
+        "last_run_at": {
+          "title": "Last Run At",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "next_run_hint": {
+          "title": "Next Run Hint",
+          "type": "string"
+        },
+        "route": {
+          "title": "Route",
+          "type": "string"
+        },
+        "run_cost_usd": {
+          "minimum": 0,
+          "title": "Run Cost Usd",
+          "type": "number"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "stale",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "route",
+        "status",
+        "last_run_at",
+        "last_data_change_at",
+        "expected_interval_hours",
+        "next_run_hint",
+        "headline",
+        "key_stats",
+        "run_cost_usd",
+        "items_count"
+      ],
+      "title": "ManifestEntry",
+      "type": "object"
+    }
+  },
+  "$id": "manifest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "agents": {
+      "items": {
+        "$ref": "#/$defs/ManifestEntry"
+      },
+      "title": "Agents",
+      "type": "array"
+    },
+    "generated_at": {
+      "title": "Generated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "generated_at",
+    "agents"
+  ],
+  "title": "Manifest",
+  "type": "object"
+}

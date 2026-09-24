@@ -1,0 +1,85 @@
+# Reusable: run one agent, commit its data, and report the run's result.
+#
+# Each agent's own cron workflow calls this, then calls deploy-site.yml as a final job
+# (pushes made with GITHUB_TOKEN don't trigger other workflows; see SPEC_WEBSITE.md §13):
+#
+#   jobs:
+#     run:
+#       uses: ./.github/workflows/run-agent.yml
+#       with: { agent: macro }
+#       secrets: inherit
+#     deploy:
+#       needs: run
+#       if: always() && needs.run.outputs.committed == 'true'
+#       uses: ./.github/workflows/deploy-site.yml
+#       permissions: { contents: read, pages: write, id-token: write }
+name: Run agent
+on:
+  workflow_call:
+    inputs:
+      agent:
+        required: true
+        type: string
+      args:
+        description: Extra runner args, e.g. --apply
+        required: false
+        type: string
+        default: ""
+    outputs:
+      committed:
+        description: "'true' if new data was pushed"
+        value: ${{ jobs.run.outputs.committed }}
+permissions:
+  contents: write
+concurrency:
+  # Agents commit to the same branch; serialize them to avoid push races.
+  group: agent-data-commit
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    outputs:
+      committed: ${{ steps.commit.outputs.committed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --no-dev
+      - name: Run ${{ inputs.agent }}
+        id: agent
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
+          SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_MAINT_TOKEN: ${{ secrets.REPO_MAINT_TOKEN }}
+          MAX_RUN_USD: ${{ vars.MAX_RUN_USD || '0.50' }}
+        run: uv run python -m core.runner "${{ inputs.agent }}" ${{ inputs.args }}
+      # A failed run still updates manifest.json (status: failed) and the cost log,
+      # so commit either way. latest.json is never touched by a failed run.
+      - name: Commit data
+        id: commit
+        run: |
+          git config user.name "agents-hub[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site/public/data data/costs.jsonl
+          if git diff --cached --quiet; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "data(${{ inputs.agent }}): run ${{ steps.agent.outcome }} $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3 4; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            sleep $((2 ** i))
+          done
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+      - name: Fail if the agent failed
+        if: steps.agent.outcome == 'failure'
+        run: exit 1

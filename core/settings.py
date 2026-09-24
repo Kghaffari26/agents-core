@@ -32,6 +32,10 @@ def costs_path() -> Path:
     return _path_from_env("COSTS_PATH", REPO_ROOT / "data" / "costs.jsonl")
 
 
+def guard_failures_path() -> Path:
+    return _path_from_env("GUARD_FAILURES_PATH", REPO_ROOT / "data" / "guard_failures.jsonl")
+
+
 def http_cache_dir() -> Path:
     return _path_from_env("HTTP_CACHE_DIR", REPO_ROOT / ".cache" / "http")
 

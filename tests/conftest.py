@@ -13,6 +13,7 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("PUBLISH_DIR", str(tmp_path / "site_data"))
     monkeypatch.setenv("COSTS_PATH", str(tmp_path / "costs.jsonl"))
     monkeypatch.setenv("HTTP_CACHE_DIR", str(tmp_path / "http_cache"))
+    monkeypatch.setenv("GUARD_FAILURES_PATH", str(tmp_path / "guard_failures.jsonl"))
     monkeypatch.setenv("MAX_RUN_USD", "0.50")
     return tmp_path
 

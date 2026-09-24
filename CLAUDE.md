@@ -113,6 +113,17 @@ cd site && npm run build                  # static export to site/out
 - Put nested published models on `core.schema.Model` (it forbids extra fields) and timestamps on `core.schema.Timestamp`. List files other than `latest.json` in `extra_models()` so their schemas get exported.
 - Never write files and never import `anthropic` from an agent.
 
+### Number guard
+
+Guard every call whose output reaches the site as narrative. `core/guards.py` checks that each number in the text matches a fact you computed, allowing for rounding to the precision shown and for K/M/B, %, bp and pp forms.
+
+- For text, use `ctx.llm.complete(..., guard=text_guard(facts), fallback=lambda: template_text)`. For structured output, use `ctx.llm.structured(..., guard=fields_guard(facts, ["summary", "bullets"]), fallback=...)` and list only the narrative fields. Numeric fields are copied from data in code.
+- `facts` is the data you put in the prompt (a dict, list or pydantic model); every int and float in it counts. Terms that look like numbers but aren't facts (such as `"S&P 500"` or a fixed `"2%"` target) go in `allow=`.
+- A failing output is retried once with the bad numbers named. If that fails too, the call returns your `fallback()` result. Every failure is logged to `data/guard_failures.jsonl`, and retries count toward `MAX_RUN_USD`.
+- Guarded calls return `Guarded(value, narrative_source, attempts, unsupported)`. Publish `narrative_source` (`core.schema.NarrativeSource`, `"llm"` or `"template"`) next to the narrative, so the site can label template text.
+- The fallback must be a deterministic template built from the same facts. It must never raise, and it must never call the LLM.
+- For batch results, call `ctx.llm.guard_batch(tier, items, results, system=..., output_model=..., guard=lambda cid, v: ..., fallback=lambda cid: ...)`. Items that fail are retried synchronously; items that errored in the batch go straight to the fallback.
+
 ## Website
 
 A single Next.js site with static export, deployed to GitHub Pages. The full spec is in `docs/specs/SPEC_WEBSITE.md`; the summary follows.

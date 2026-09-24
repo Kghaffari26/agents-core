@@ -6,17 +6,21 @@ each call. Prompts are laid out for caching: stable `system` and `context` block
 (cache breakpoint on the last of them), per-run data in the user message after it.
 
 Numbers come from data, never from the model: pass computed figures in the prompt and
-ask for narrative only. Validate narrative against those figures with the evals.
+ask for narrative only. Pass `guard=` (see core/guards.py) to check the narrative: a
+failing output is retried once with the unsupported numbers named, then replaced by
+`fallback()`. Guarded calls return `Guarded(value, narrative_source, ...)`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from typing import Any, TypeVar
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any, TypeVar, overload
 
 import anthropic
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
@@ -25,10 +29,13 @@ from pydantic import BaseModel, ValidationError
 
 from core import settings
 from core.costs import CostTracker, Tier, Usage, usd_for
+from core.guards import GuardResult
+from core.schema import NarrativeSource, iso_z
 
 log = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+V = TypeVar("V")
 
 # Rough chars-per-token used only for the pre-call budget estimate.
 _CHARS_PER_TOKEN = 3.5
@@ -37,6 +44,29 @@ _SDK_MAX_RETRIES = 4
 
 class LLMError(RuntimeError):
     """The model returned something unusable (refusal, truncation, schema mismatch)."""
+
+
+class GuardFailed(LLMError):
+    """The number guard failed twice and no fallback was given."""
+
+
+RETRY_INSTRUCTION = (
+    "These numbers are not in the input: [{tokens}]. Rewrite using only numbers provided."
+)
+
+
+@dataclass(frozen=True)
+class Guarded[R]:
+    """Result of a guarded call. `narrative_source` is "template" when the fallback ran.
+
+    `unsupported` lists the numbers that failed the last guard check (empty when the
+    first attempt passed).
+    """
+
+    value: R
+    narrative_source: NarrativeSource
+    attempts: int
+    unsupported: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -148,6 +178,27 @@ class LLM:
 
     # ---- single calls -----------------------------------------------------
 
+    def _send(
+        self, tier: Tier, params: dict[str, Any], output_model: type[T] | None, purpose: str
+    ) -> Any:
+        """One budget-checked, cost-logged call. Returns text, or the parsed model."""
+        self.tracker.check(self._estimate_usd(params))
+        if output_model is None:
+            message = self.client.messages.create(**params)
+        else:
+            message = self.client.messages.parse(output_format=output_model, **params)
+        self.tracker.record(
+            tier=tier, model=params["model"], usage=Usage.from_api(message.usage), purpose=purpose
+        )
+        self._check_stop(message, purpose)
+        if output_model is None:
+            return self._text(message)
+        parsed = getattr(message, "parsed_output", None)
+        if parsed is None:
+            raise LLMError(f"{purpose}: no parsed output returned")
+        return parsed
+
+    @overload
     def complete(
         self,
         tier: Tier,
@@ -157,19 +208,78 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
-    ) -> str:
-        """Return plain text. Use `structured` when the output feeds a schema."""
+        guard: None = None,
+        fallback: None = None,
+    ) -> str: ...
+
+    @overload
+    def complete(
+        self,
+        tier: Tier,
+        prompt: str,
+        *,
+        system: str,
+        context: str | None = None,
+        max_tokens: int | None = None,
+        purpose: str = "",
+        guard: Callable[[str], GuardResult],
+        fallback: Callable[[], str] | None = None,
+    ) -> Guarded[str]: ...
+
+    def complete(
+        self,
+        tier: Tier,
+        prompt: str,
+        *,
+        system: str,
+        context: str | None = None,
+        max_tokens: int | None = None,
+        purpose: str = "",
+        guard: Callable[[str], GuardResult] | None = None,
+        fallback: Callable[[], str] | None = None,
+    ) -> str | Guarded[str]:
+        """Return plain text, or `Guarded[str]` when a guard is given.
+
+        Use `structured` when the output feeds a schema.
+        """
         cfg = tier_config(tier)
         params = self._params(
             cfg, system=system, prompt=prompt, context=context, max_tokens=max_tokens
         )
-        self.tracker.check(self._estimate_usd(params))
-        message = self.client.messages.create(**params)
-        self.tracker.record(
-            tier=tier, model=cfg.model, usage=Usage.from_api(message.usage), purpose=purpose
-        )
-        self._check_stop(message, purpose)
-        return self._text(message)
+        text = self._send(tier, params, None, purpose)
+        if guard is None:
+            return text
+        return self._guarded(tier, params, text, guard, fallback, None, purpose)
+
+    @overload
+    def structured(
+        self,
+        tier: Tier,
+        prompt: str,
+        output_model: type[T],
+        *,
+        system: str,
+        context: str | None = None,
+        max_tokens: int | None = None,
+        purpose: str = "",
+        guard: None = None,
+        fallback: None = None,
+    ) -> T: ...
+
+    @overload
+    def structured(
+        self,
+        tier: Tier,
+        prompt: str,
+        output_model: type[T],
+        *,
+        system: str,
+        context: str | None = None,
+        max_tokens: int | None = None,
+        purpose: str = "",
+        guard: Callable[[T], GuardResult],
+        fallback: Callable[[], T] | None = None,
+    ) -> Guarded[T]: ...
 
     def structured(
         self,
@@ -181,22 +291,105 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
-    ) -> T:
-        """Return a validated `output_model` instance using structured outputs."""
+        guard: Callable[[T], GuardResult] | None = None,
+        fallback: Callable[[], T] | None = None,
+    ) -> T | Guarded[T]:
+        """Return a validated `output_model` instance using structured outputs, or
+        `Guarded[output_model]` when a guard is given. Build the guard with
+        `core.guards.fields_guard(facts, [...narrative fields...])`.
+        """
         cfg = tier_config(tier)
         params = self._params(
             cfg, system=system, prompt=prompt, context=context, max_tokens=max_tokens
         )
-        self.tracker.check(self._estimate_usd(params))
-        message = self.client.messages.parse(output_format=output_model, **params)
-        self.tracker.record(
-            tier=tier, model=cfg.model, usage=Usage.from_api(message.usage), purpose=purpose
-        )
-        self._check_stop(message, purpose)
-        parsed = getattr(message, "parsed_output", None)
-        if parsed is None:
-            raise LLMError(f"{purpose}: no parsed output returned")
-        return parsed
+        parsed = self._send(tier, params, output_model, purpose)
+        if guard is None:
+            return parsed
+        return self._guarded(tier, params, parsed, guard, fallback, output_model, purpose)
+
+    # ---- number guard -----------------------------------------------------
+
+    def _guarded(
+        self,
+        tier: Tier,
+        params: dict[str, Any],
+        first: V,
+        guard: Callable[[V], GuardResult],
+        fallback: Callable[[], V] | None,
+        output_model: type[T] | None,
+        purpose: str,
+    ) -> Guarded[V]:
+        """Check `first`; on failure retry once in the same conversation, then fall back."""
+        result = guard(first)
+        if result.ok:
+            return Guarded(first, "llm", attempts=1)
+        self._log_guard_failure(params, purpose, 1, first, result.unsupported)
+
+        retry_params = {
+            **params,
+            "messages": [
+                *params["messages"],
+                {"role": "assistant", "content": self._as_text(first)},
+                {
+                    "role": "user",
+                    "content": RETRY_INSTRUCTION.format(tokens=", ".join(result.unsupported)),
+                },
+            ],
+        }
+        try:
+            second = self._send(tier, retry_params, output_model, f"{purpose}:guard-retry")
+        except LLMError as e:
+            # A refusal or truncation on the retry is treated as a second guard failure.
+            self._log_guard_failure(params, purpose, 2, None, result.unsupported, error=str(e))
+            unsupported = result.unsupported
+        else:
+            result = guard(second)
+            if result.ok:
+                return Guarded(second, "llm", attempts=2)
+            self._log_guard_failure(params, purpose, 2, second, result.unsupported)
+            unsupported = result.unsupported
+
+        if fallback is None:
+            raise GuardFailed(f"{purpose}: unsupported numbers after retry: {unsupported}")
+        log.warning("%s: number guard failed twice; using template fallback", purpose)
+        return Guarded(fallback(), "template", attempts=2, unsupported=unsupported)
+
+    @staticmethod
+    def _as_text(value: Any) -> str:
+        return value.model_dump_json() if isinstance(value, BaseModel) else str(value)
+
+    @staticmethod
+    def _prompt_hash(params: dict[str, Any]) -> str:
+        material = json.dumps([params["system"], params["messages"][0]], sort_keys=True)
+        return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+    def _log_guard_failure(
+        self,
+        params: dict[str, Any],
+        purpose: str,
+        attempt: int,
+        output: Any,
+        unsupported: list[str],
+        *,
+        error: str | None = None,
+    ) -> None:
+        entry = {
+            "ts": iso_z(datetime.now(UTC)),
+            "run_id": self.tracker.run_id,
+            "agent": self.tracker.agent,
+            "purpose": purpose,
+            "attempt": attempt,
+            "prompt_hash": self._prompt_hash(params),
+            "output": None if output is None else self._as_text(output),
+            "unsupported": unsupported,
+        }
+        if error:
+            entry["error"] = error
+        path = settings.guard_failures_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log.warning("%s: number guard attempt %d failed: %s", purpose, attempt, unsupported)
 
     # ---- batch ------------------------------------------------------------
 
@@ -303,3 +496,52 @@ class LLM:
             return BatchResult(cid, value=output_model.model_validate_json(text))
         except ValidationError as e:
             return BatchResult(cid, error=f"schema mismatch: {e.error_count()} errors")
+
+    def guard_batch(
+        self,
+        tier: Tier,
+        items: Sequence[BatchItem],
+        results: dict[str, BatchResult[Any]],
+        *,
+        system: str,
+        guard: Callable[[str, Any], GuardResult],
+        fallback: Callable[[str], Any],
+        context: str | None = None,
+        output_model: type[T] | None = None,
+        purpose: str = "",
+    ) -> dict[str, Guarded[Any]]:
+        """Apply the number guard to `batch()` results, keyed by custom_id.
+
+        `guard(custom_id, value)` and `fallback(custom_id)` take the item's ID so each
+        item can be checked against its own facts. A failing item is retried once
+        synchronously (full price, counted toward MAX_RUN_USD) in the same conversation,
+        then falls back. Items that errored in the batch go straight to the fallback.
+        Pass the same `system`, `context` and `output_model` as the batch call.
+        """
+        cfg = tier_config(tier)
+        guarded: dict[str, Guarded[Any]] = {}
+        for item in items:
+            cid = item.custom_id
+            res = results.get(cid)
+            if res is None or not res.ok:
+                log.warning(
+                    "%s:%s: batch item failed (%s); using fallback",
+                    purpose,
+                    cid,
+                    None if res is None else res.error,
+                )
+                guarded[cid] = Guarded(fallback(cid), "template", attempts=1)
+                continue
+            params = self._params(
+                cfg, system=system, prompt=item.prompt, context=context, max_tokens=item.max_tokens
+            )
+            guarded[cid] = self._guarded(
+                tier,
+                params,
+                res.value,
+                lambda value, cid=cid: guard(cid, value),
+                lambda cid=cid: fallback(cid),
+                output_model,
+                f"{purpose}:{cid}",
+            )
+        return guarded

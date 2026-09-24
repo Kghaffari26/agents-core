@@ -136,3 +136,136 @@ def test_missing_api_key_is_a_clear_error(monkeypatch):
     llm = LLM(CostTracker(agent="a", run_id="r"))
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         llm.complete("fast", "p", system="s")
+
+
+# ---- number guard -------------------------------------------------------------
+
+from core.guards import fields_guard, text_guard  # noqa: E402
+from core.llm import Guarded, GuardFailed  # noqa: E402
+
+FACTS = {"cpi": 2.9, "payrolls": 142_000}
+
+
+def guard_log(isolated_paths):
+    path = isolated_paths / "guard_failures.jsonl"
+    return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_guard_pass_first_try(isolated_paths):
+    llm, client, _ = make_llm([fake_message("CPI held at 2.9%.")])
+    out = llm.complete("smart", "p", system="s", guard=text_guard(FACTS))
+    assert out == Guarded("CPI held at 2.9%.", "llm", attempts=1)
+    assert len(client.messages.calls) == 1
+    assert guard_log(isolated_paths) == []
+
+
+def test_guard_retry_succeeds(isolated_paths):
+    llm, client, tracker = make_llm(
+        [
+            fake_message("CPI rose to 3.1%."),
+            fake_message("CPI held at 2.9%."),
+        ]
+    )
+    out = llm.complete("smart", "cpi=2.9", system="s", guard=text_guard(FACTS), purpose="brief")
+    assert out.value == "CPI held at 2.9%."
+    assert (out.narrative_source, out.attempts) == ("llm", 2)
+    retry = client.messages.calls[1]["messages"]
+    assert retry[0] == {"role": "user", "content": "cpi=2.9"}
+    assert retry[1] == {"role": "assistant", "content": "CPI rose to 3.1%."}
+    assert retry[2]["content"] == (
+        "These numbers are not in the input: [3.1%]. Rewrite using only numbers provided."
+    )
+    assert tracker.calls == 2  # the retry is billed and budgeted
+    (entry,) = guard_log(isolated_paths)
+    assert entry["attempt"] == 1 and entry["unsupported"] == ["3.1%"]
+    assert entry["agent"] == "macro" and entry["run_id"] == "r1"
+    assert entry["purpose"] == "brief" and len(entry["prompt_hash"]) == 16
+    assert entry["output"] == "CPI rose to 3.1%."
+
+
+def test_guard_falls_back_after_second_failure(isolated_paths):
+    llm, _, _ = make_llm([fake_message("CPI 3.1%."), fake_message("CPI 3.2%.")])
+    out = llm.complete(
+        "smart", "p", system="s", guard=text_guard(FACTS), fallback=lambda: "CPI was 2.9%."
+    )
+    assert out == Guarded("CPI was 2.9%.", "template", attempts=2, unsupported=["3.2%"])
+    assert [e["attempt"] for e in guard_log(isolated_paths)] == [1, 2]
+
+
+def test_guard_without_fallback_raises():
+    llm, _, _ = make_llm([fake_message("CPI 3.1%."), fake_message("CPI 3.2%.")])
+    with pytest.raises(GuardFailed):
+        llm.complete("smart", "p", system="s", guard=text_guard(FACTS))
+
+
+def test_guard_refusal_on_retry_falls_back(isolated_paths):
+    llm, _, _ = make_llm([fake_message("CPI 3.1%."), fake_message("", stop_reason="refusal")])
+    out = llm.complete(
+        "smart", "p", system="s", guard=text_guard(FACTS), fallback=lambda: "template"
+    )
+    assert out.narrative_source == "template"
+    second = guard_log(isolated_paths)[1]
+    assert second["attempt"] == 2 and second["output"] is None
+    assert "refused" in second["error"]
+
+
+def test_guard_retry_respects_budget():
+    # First call fits the cap; the retry's worst-case estimate does not.
+    llm, client, _ = make_llm([fake_message("CPI 3.1%.", output_tokens=5000)], max_usd=0.1)
+    with pytest.raises(BudgetExceeded):
+        llm.complete("smart", "p", system="s", guard=text_guard(FACTS), fallback=lambda: "t")
+    assert len(client.messages.calls) == 1
+
+
+def test_structured_guard_checks_named_fields(isolated_paths):
+    bad = Brief(summary="CPI 3.1%", bullets=["ok"])
+    good = Brief(summary="CPI 2.9%", bullets=["payrolls +142K"])
+    llm, client, _ = make_llm([fake_message("{}", parsed=bad), fake_message("{}", parsed=good)])
+    out = llm.structured(
+        "smart",
+        "p",
+        Brief,
+        system="s",
+        guard=fields_guard(FACTS, ["summary", "bullets"]),
+        fallback=lambda: Brief(summary="t", bullets=[]),
+    )
+    assert out == Guarded(good, "llm", attempts=2)
+    assert client.messages.calls[1]["output_format"] is Brief
+    assert client.messages.calls[1]["messages"][1]["content"] == bad.model_dump_json()
+
+
+def test_guard_batch_retries_failures_synchronously(isolated_paths):
+    facts = {"a": [5], "b": [7], "c": [9]}
+    batches = FakeBatches(
+        [
+            _batch_entry("a", json.dumps({"summary": "5 bids", "bullets": []})),
+            _batch_entry("b", json.dumps({"summary": "8 bids", "bullets": []})),
+            _batch_entry("c", error="overloaded"),
+        ],
+        polls_before_end=0,
+    )
+    retry_ok = Brief(summary="7 bids", bullets=[])
+    llm, client, tracker = make_llm([fake_message("{}", parsed=retry_ok)], batches=batches)
+    items = [BatchItem("a", "pa"), BatchItem("b", "pb"), BatchItem("c", "pc")]
+    results = llm.batch("fast", items, system="score", output_model=Brief)
+
+    guarded = llm.guard_batch(
+        "fast",
+        items,
+        results,
+        system="score",
+        output_model=Brief,
+        guard=lambda cid, v: fields_guard(facts[cid], ["summary"])(v),
+        fallback=lambda cid: Brief(summary=f"template {cid}", bullets=[]),
+        purpose="score",
+    )
+    assert guarded["a"] == Guarded(Brief(summary="5 bids", bullets=[]), "llm", attempts=1)
+    assert guarded["b"] == Guarded(retry_ok, "llm", attempts=2)
+    assert guarded["c"].narrative_source == "template"
+    assert guarded["c"].value.summary == "template c"
+    (retry,) = client.messages.calls  # only b was retried, synchronously
+    assert retry["messages"][0]["content"] == "pb"
+    assert "[8]" in retry["messages"][2]["content"]
+    assert guard_log(isolated_paths)[0]["purpose"] == "score:b"
+    entries = [json.loads(x) for x in tracker.path.read_text().splitlines()]
+    assert [e["batch"] for e in entries] == [True, True, False]

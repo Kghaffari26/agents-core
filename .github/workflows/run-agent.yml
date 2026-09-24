@@ -62,14 +62,14 @@ jobs:
           REPO_MAINT_TOKEN: ${{ secrets.REPO_MAINT_TOKEN }}
           MAX_RUN_USD: ${{ vars.MAX_RUN_USD || '0.50' }}
         run: uv run python -m core.runner "${{ inputs.agent }}" ${{ inputs.args }}
-      # A failed run still updates manifest.json (status: failed) and the cost log,
-      # so commit either way. latest.json is never touched by a failed run.
+      # A failed run still updates manifest.json (status: failed), the cost log and the
+      # guard failure log, so commit either way. latest.json is never touched by a failed run.
       - name: Commit data
         id: commit
         run: |
           git config user.name "agents-hub[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site/public/data data/costs.jsonl
+          git add site/public/data data/
           if git diff --cached --quiet; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
             exit 0

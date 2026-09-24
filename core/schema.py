@@ -12,6 +12,8 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, PlainSerializer
 
 RunStatus = Literal["ok", "stale", "failed"]
+# "llm" when the narrative passed the number guard, "template" when the fallback ran.
+NarrativeSource = Literal["llm", "template"]
 GoodDirection = Literal["up", "down", "neutral"]
 StatFormat = Literal[
     "currency_compact",

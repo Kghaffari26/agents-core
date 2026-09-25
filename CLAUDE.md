@@ -1,138 +1,79 @@
-# Agents Hub
+# agents-core
 
-A monorepo of four scheduled data agents that feed one static website, with each agent getting its own section.
+A pip-installable shared package for a family of scheduled data agents. It ships
+**no agents of its own** — four separate repos depend on it: `real-estate-agent`,
+`fed-agent`, `sam-agent`, and `repo-maintain-agent` (all under `Kghaffari26`). See
+`README.md` for the full public contract (install line, agent registration, the
+number guard, the data-branch contract, the reusable workflow); this file is
+working notes for whoever's changing code in *this* repo.
 
-| Agent | What it does | Schedule |
-|---|---|---|
-| `real_estate` | Tracks metro housing markets (prices, inventory, days on market, price cuts, permits) against mortgage rates; writes a weekly brief per metro | Weekly (Fri) |
-| `macro` | Tracks key macro indicators and Fed communications; explains what changed since the last release | Weekdays |
-| `grants` | Finds federal contracts and grants matching a business profile; scores fit and drafts a summary | Daily |
-| `repo_maint` | Triages issues, flags stale PRs, drafts changelogs for configured GitHub repos | Daily |
-
-## Architecture
+## Layout
 
 ```
-agents-hub/
-├── CLAUDE.md
-├── pyproject.toml              # uv-managed, Python 3.12
-├── config/
-│   ├── models.toml             # model IDs per task tier
-│   ├── metros.toml             # tracked metros (real estate)
-│   ├── business_profile.toml   # NAICS codes, keywords, set-asides (grants)
-│   └── repos.toml              # repos the maintenance agent watches
-├── core/
-│   ├── agent.py                # Agent base class, AgentResult, RunContext (the agent contract)
-│   ├── registry.py             # known agent IDs; loads agents/<id>/agent.py:AGENT
-│   ├── llm.py                  # the ONLY place the Anthropic SDK is imported
-│   ├── http.py                 # retries, rate limiting, request budgets, on-disk cache
-│   ├── schema.py               # shared pydantic models (RunMeta, Citation, Manifest, etc.)
-│   ├── publish.py              # writes site data files, manifest, trims history
-│   ├── costs.py                # token/$ logging, per-run budget cap, cost summary
-│   ├── settings.py             # paths, env vars, config/*.toml loading
-│   ├── export_schemas.py       # pydantic → schemas/*.schema.json for the site
-│   └── runner.py               # `python -m core.runner <agent>` entry point
-├── agents/
-│   ├── real_estate/            # fetch.py, transform.py, analyze.py, schema.py
-│   ├── macro/
-│   ├── grants/
-│   └── repo_maint/
-├── evals/                      # small fixture-based checks per agent
+agents-core/
+├── pyproject.toml              # name "agents-core", src layout, hatchling
+├── src/agents_core/
+│   ├── agent.py                 # Agent base class, AgentResult, RunContext (the agent contract)
+│   ├── registry.py              # entry-point discovery (group "agents_core.agents")
+│   ├── runner.py                 # agents-run console script: fetch->transform->analyze->publish
+│   ├── llm.py                   # the ONLY place the Anthropic SDK is imported
+│   ├── guards.py                 # the number guard (verify_numbers, text_guard, fields_guard)
+│   ├── http.py                  # retries, rate limiting, request budgets, on-disk cache
+│   ├── costs.py                  # CostTracker, BudgetExceeded, costs-summary.json
+│   ├── publish.py                # atomic JSON writes, dated history, manifest-entry.json
+│   ├── export_schemas.py        # schema.json, written automatically at publish time
+│   ├── schema.py                 # shared pydantic models (RunMeta, ManifestEntry, etc.)
+│   ├── settings.py               # data_dir()/publish_dir(), config/models.toml loading
+│   └── config/models.toml       # packaged default model tiers + pricing
 ├── tests/
-├── site/                       # Next.js (App Router, static export), Tailwind, Recharts
-│   └── public/data/<agent>/    # latest.json + history/YYYY-MM-DD.json
-└── .github/workflows/          # one cron workflow per agent + site deploy
+│   ├── fake_agent.py             # FakeAgent + module-level AGENT, used across most tests
+│   └── test_install_entry_point.py  # real uv sync + agents-run subprocess integration test
+├── docs/specs/                  # historical, pre-package design specs — not current
+└── .github/workflows/
+    ├── ci.yml                    # ruff + pytest + actionlint
+    └── run-agent.yml             # workflow_call only; agent repos call this
 ```
-
-Data flow: **fetch → transform (pure Python, no LLM) → analyze (LLM narrative) → validate (pydantic) → publish JSON → site rebuilds.**
-
-## Specs (read the relevant one before working on a component)
-
-| Component | Spec |
-|---|---|
-| Website (`site/`) | `docs/specs/SPEC_WEBSITE.md` |
-| Macro & Fed agent (build first; defines `core/guards.py`) | `docs/specs/SPEC_MACRO.md` |
-| Real estate agent | `docs/specs/SPEC_REAL_ESTATE.md` |
-| Grants & contracts agent | `docs/specs/SPEC_GRANTS.md` |
-| Repo maintenance agent | `docs/specs/SPEC_REPO_MAINT.md` |
-
-Section §6 of each agent spec is the JSON contract the website depends on. Change it only together with the site types. **Where this file or BUILD_PLAN.md disagrees with a spec, the spec wins.**
 
 ## Rules
 
-- **Numbers come from data, never from the model.** Compute every figure in Python. The LLM only writes narrative from numbers passed into the prompt and must not introduce new figures. Evals check this.
-- Every narrative claim carries a citation (source name + URL) in the output schema.
-- All LLM calls go through `core/llm.py`, which handles model tiers, prompt caching, retries, and cost logging. Never import `anthropic` elsewhere.
-- Model tiers are set in `config/models.toml`: a `fast` tier for extraction and classification, a `smart` tier for final synthesis only. Default fast = `claude-haiku-4-5-20251001`, smart = `claude-sonnet-5` (verify current IDs at docs.claude.com).
-- Use the Batch API for non-urgent bulk work (e.g., scoring many grant listings).
-- Each run logs tokens and USD to `data/costs.jsonl` and aborts if it exceeds `MAX_RUN_USD` (default `0.50`).
-- All HTTP goes through `core/http.py` with a cache, so re-runs during development don't re-download or re-bill.
-- Every agent output validates against its pydantic schema before publishing. A failed validation fails the run, leaving the previous `latest.json` untouched.
-- Keep published JSON small. Pre-aggregate, keep at most 52 weekly or 90 daily history files, and never ship raw source dumps to the site.
-- Secrets come from environment variables only (`ANTHROPIC_API_KEY`, `FRED_API_KEY`, `BLS_API_KEY`, `SAM_API_KEY`, `GITHUB_TOKEN`). Never commit them. Include a `.env.example`.
-- `repo_maint` is **read-only by default**. Labeling or commenting requires the `--apply` flag and a repo that is on the allowlist in `config/repos.toml`.
-- Respect source terms: attribute Redfin, Zillow, FRED, etc. on the site, and don't redistribute raw datasets.
-
-## Data sources
-
-| Agent | Source | Access |
-|---|---|---|
-| real_estate | Redfin Data Center (metro-level market tracker) | Public download, attribution required |
-| real_estate | Zillow Research (ZHVI home values, ZORI rents) | Public CSV, attribution required |
-| real_estate | FRED: MORTGAGE30US, HOUST, CSUSHPINSA, MSPUS | Free API key |
-| real_estate | Census Building Permits Survey (CBSA files), Gazetteer (centroids), ACS (median income) | Public; optional `CENSUS_API_KEY` |
-| macro | FRED (inflation, labor, growth, rates, sentiment; see spec §2) and FRED release calendar | Free API key |
-| macro | BLS API (optional fallback, off by default) | Free API key |
-| macro | Federal Reserve RSS feed, FOMC statements and minutes, meeting calendar | Public pages |
-| grants | SAM.gov Get Opportunities API v2 (**~10 requests/day on a basic key**, so budget every call) | Free API key (sam.gov account) |
-| grants | Grants.gov `search2` + `fetchOpportunity` | Public, no key |
-| repo_maint | GitHub REST API | `GITHUB_TOKEN`; `REPO_MAINT_TOKEN` (fine-grained PAT) for writes to your other repos |
-
-Verify every endpoint and file URL before relying on it, since public dataset URLs change.
+- **`agents_core.llm` is the only place the `anthropic` package is imported.** Never
+  import it elsewhere — agents get Claude access only through `ctx.llm`.
+- **Numbers come from data, never from the model.** Compute every figure in
+  `transform`; `analyze` passes those numbers into prompts and asks for narrative
+  only. Guard every call whose output reaches published narrative with `text_guard`/
+  `fields_guard` (`agents_core.guards`) — see the README's "number guard" section.
+- **This package ships no agents.** Don't add an `agents/` directory or agent-specific
+  code here — that lives in the four dependent repos, registered via the
+  `agents_core.agents` entry-point group.
+- **No cross-agent state.** `data_dir()`/`publish_dir()` are always for *one* agent's
+  own run; there's no merged `manifest.json` or shared `schemas/` directory here — an
+  agent publishes its own `manifest-entry.json`/`schema.json`, and a consuming site
+  does any cross-agent merge itself.
+- **Paths are CWD-relative, not repo-relative.** This package is installed into other
+  repos' environments; nothing in it may assume it can find its own source tree at
+  runtime (no `Path(__file__).parents[...]`-based repo-root resolution outside of
+  `importlib.resources` for the packaged `config/models.toml` default).
+- **`run-agent.yml` is `workflow_call`-only.** It must never gain a `push`/
+  `pull_request`/`schedule` trigger of its own — it only runs when another repo's
+  workflow calls it.
+- Every change to a public module (`agent.py`, `schema.py`, `llm.py`, `guards.py`,
+  `registry.py`, `runner.py`, `publish.py`, `costs.py`, `export_schemas.py`,
+  `http.py`, `settings.py`) or to the data-branch contract is a breaking change for
+  four other repos — update `README.md`'s matching section in the same change.
 
 ## Commands
 
 ```bash
-uv sync                                   # install
-uv run python -m core.runner <agent>      # run one agent (writes to site/public/data)
-uv run python -m core.runner <agent> --dry-run   # fetch + transform, skip LLM + publish
-uv run pytest                             # tests
-uv run python -m evals.run <agent>        # evals
-uv run python -m core.export_schemas      # regenerate schemas/ after changing an output model
-cd site && npm run dev                    # local site
-cd site && npm run build                  # static export to site/out
+uv sync                                    # install (editable)
+uv run pytest                              # tests, including the real install/entry-point test
+uv run ruff check .                        # lint
+uv run ruff format --check .               # format check
+/tmp/actionlint .github/workflows/*.yml    # or `actionlint` if on PATH
 ```
 
-## Building an agent on core
+## Releasing
 
-- Create `agents/<id>/agent.py` with a subclass of `core.agent.Agent` and a module-level `AGENT = MyAgent()`. The ID must already be in `core.registry.AGENT_IDS`.
-- Set the class attributes: `name`, `route`, `schema_version`, `expected_interval_hours`, `next_run_hint`, `history_keep` (52 weekly / 90 daily), and `output_model` (a subclass of `core.schema.AgentOutput`, which already carries `meta`).
-- Implement `fetch(ctx)` with `ctx.http` only, `transform(ctx, raw)` as pure Python with no LLM, and `analyze(ctx, data)` with `ctx.llm.complete / .structured / .batch`. Return an `AgentResult`: `body` is every field except `meta` (the runner builds `meta`), and `files` holds extra JSON such as `metros/<slug>.json`.
-- Build `headline` and `key_stats` in code. Set `data_changed=False` and reuse `ctx.previous_latest()` narrative when the sources haven't changed.
-- Rate limits and daily request caps go in `configure_http(http)`, e.g. `http.set_policy("api.sam.gov", HostPolicy(daily_budget=10))`.
-- Put stable instructions in `system=` / `context=` (they're cached) and per-run numbers in the prompt.
-- Put nested published models on `core.schema.Model` (it forbids extra fields) and timestamps on `core.schema.Timestamp`. List files other than `latest.json` in `extra_models()` so their schemas get exported.
-- Never write files and never import `anthropic` from an agent.
-
-### Number guard
-
-Guard every call whose output reaches the site as narrative. `core/guards.py` checks that each number in the text matches a fact you computed, allowing for rounding to the precision shown and for K/M/B, %, bp and pp forms.
-
-- For text, use `ctx.llm.complete(..., guard=text_guard(facts), fallback=lambda: template_text)`. For structured output, use `ctx.llm.structured(..., guard=fields_guard(facts, ["summary", "bullets"]), fallback=...)` and list only the narrative fields. Numeric fields are copied from data in code.
-- `facts` is the data you put in the prompt (a dict, list or pydantic model); every int and float in it counts. Terms that look like numbers but aren't facts (such as `"S&P 500"` or a fixed `"2%"` target) go in `allow=`.
-- A failing output is retried once with the bad numbers named. If that fails too, the call returns your `fallback()` result. Every failure is logged to `data/guard_failures.jsonl`, and retries count toward `MAX_RUN_USD`.
-- Guarded calls return `Guarded(value, narrative_source, attempts, unsupported)`. Publish `narrative_source` (`core.schema.NarrativeSource`, `"llm"` or `"template"`) next to the narrative, so the site can label template text.
-- The fallback must be a deterministic template built from the same facts. It must never raise, and it must never call the LLM.
-- For batch results, call `ctx.llm.guard_batch(tier, items, results, system=..., output_model=..., guard=lambda cid, v: ..., fallback=lambda cid: ...)`. Items that fail are retried synchronously; items that errored in the batch go straight to the fallback.
-
-## Website
-
-A single Next.js site with static export, deployed to GitHub Pages. The full spec is in `docs/specs/SPEC_WEBSITE.md`; the summary follows.
-
-- `/` shows an overview with a card per agent: last run time, status, headline finding, and link.
-- `/real-estate` is **interactive**. It has a metro search and select, a compare mode for up to 3 metros, metric toggles (median sale price, inventory, days on market, % with price drops, sale-to-list), a time-range selector, a 30-yr mortgage rate overlay, a map colored by YoY price change, an affordability calculator (monthly payment on the metro median at the current rate), and the weekly AI brief per metro.
-- `/macro` shows an indicator grid with sparklines and the latest-vs-prior change, a "what changed" summary, and an FOMC statement diff view.
-- `/grants` has a filterable, sortable table (deadline, agency, amount, NAICS, fit score) with an expandable fit summary.
-- `/repos` shows per-repo health (untriaged issues, stale PRs, latest changelog draft).
-- Every section shows data source attribution and "last updated."
-- The site reads only from `public/data/**`. No runtime API calls and no secrets in the frontend.
-- It works at phone width and supports dark mode.
+Agent repos and `run-agent.yml`'s own doc example pin a tag (`@v0.1.0`). Bump
+`pyproject.toml`'s `version`, then a human (not an agent session) tags and pushes:
+`git tag v0.1.0 && git push origin v0.1.0` — agent sessions in this repo should never
+push a tag themselves.

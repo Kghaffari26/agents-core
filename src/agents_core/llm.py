@@ -27,10 +27,10 @@ from anthropic.types.message_create_params import MessageCreateParamsNonStreamin
 from anthropic.types.messages.batch_create_params import Request
 from pydantic import BaseModel, ValidationError
 
-from core import settings
-from core.costs import CostTracker, Tier, Usage, usd_for
-from core.guards import GuardResult
-from core.schema import NarrativeSource, iso_z
+from agents_core import settings
+from agents_core.costs import CostTracker, Tier, Usage, usd_for
+from agents_core.guards import GuardResult
+from agents_core.schema import NarrativeSource, iso_z
 
 log = logging.getLogger(__name__)
 
@@ -296,7 +296,7 @@ class LLM:
     ) -> T | Guarded[T]:
         """Return a validated `output_model` instance using structured outputs, or
         `Guarded[output_model]` when a guard is given. Build the guard with
-        `core.guards.fields_guard(facts, [...narrative fields...])`.
+        `agents_core.guards.fields_guard(facts, [...narrative fields...])`.
         """
         cfg = tier_config(tier)
         params = self._params(

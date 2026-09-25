@@ -1,85 +1,147 @@
-# Reusable: run one agent, commit its data, and report the run's result.
+# Reusable: run one agent, commit its local state, force-push its published output to
+# a `data` branch as a single orphan commit, and optionally notify a site repo.
 #
-# Each agent's own cron workflow calls this, then calls deploy-site.yml as a final job
-# (pushes made with GITHUB_TOKEN don't trigger other workflows; see SPEC_WEBSITE.md §13):
+# `workflow_call` only — this is a library workflow, never triggered directly. An
+# agent repo calls it from its own cron/dispatch workflow, e.g.:
 #
+#   name: Run macro agent
+#   on:
+#     schedule: [{cron: "0 14 * * 1-5"}]
+#     workflow_dispatch:
 #   jobs:
 #     run:
-#       uses: ./.github/workflows/run-agent.yml
-#       with: { agent: macro }
+#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.1.0
+#       with:
+#         agent: macro
+#         site_repo: Kghaffari26/agents-hub-site   # optional
 #       secrets: inherit
-#     deploy:
-#       needs: run
-#       if: always() && needs.run.outputs.committed == 'true'
-#       uses: ./.github/workflows/deploy-site.yml
-#       permissions: { contents: read, pages: write, id-token: write }
+#
+# `secrets: inherit` passes through whichever of ANTHROPIC_API_KEY, FRED_API_KEY,
+# SAM_API_KEY, CENSUS_API_KEY, SITE_DISPATCH_TOKEN the caller has set — any of them
+# may be missing; this workflow never requires one that a given agent doesn't need.
 name: Run agent
 on:
   workflow_call:
     inputs:
       agent:
+        description: Registered agent name (agents_core.agents entry-point name)
         required: true
         type: string
-      args:
-        description: Extra runner args, e.g. --apply
+      extra_args:
+        description: Extra arguments appended to `agents-run <agent>`, e.g. --force-briefs
         required: false
         type: string
         default: ""
-    outputs:
-      committed:
-        description: "'true' if new data was pushed"
-        value: ${{ jobs.run.outputs.committed }}
+      max_run_usd:
+        description: Per-run LLM spend cap in USD (AGENTS_CORE_MAX_RUN_USD)
+        required: false
+        type: string
+        default: "0.50"
+      site_repo:
+        description: "owner/repo to notify via repository_dispatch (skipped if unset)"
+        required: false
+        type: string
+        default: ""
+      python_version:
+        required: false
+        type: string
+        default: "3.12"
+      cache_path:
+        description: Path to cache between runs via actions/cache (skipped if unset)
+        required: false
+        type: string
+        default: ""
 permissions:
   contents: write
 concurrency:
-  # Agents commit to the same branch; serialize them to avoid push races.
-  group: agent-data-commit
+  group: agents-data-push-${{ github.repository }}
   cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 240
-    outputs:
-      committed: ${{ steps.commit.outputs.committed }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main
+
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - run: uv sync --locked --no-dev
+          python-version: ${{ inputs.python_version }}
+
+      - uses: actions/cache@v4
+        if: inputs.cache_path != ''
+        with:
+          path: ${{ inputs.cache_path }}
+          key: ${{ github.repository }}-${{ inputs.agent }}-${{ github.run_id }}
+          restore-keys: ${{ github.repository }}-${{ inputs.agent }}-
+
+      - run: uv sync
+
       - name: Run ${{ inputs.agent }}
         id: agent
         continue-on-error: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
           CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_MAINT_TOKEN: ${{ secrets.REPO_MAINT_TOKEN }}
-          MAX_RUN_USD: ${{ vars.MAX_RUN_USD || '0.50' }}
-        run: uv run python -m core.runner "${{ inputs.agent }}" ${{ inputs.args }}
-      # A failed run still updates manifest.json (status: failed), the cost log and the
-      # guard failure log, so commit either way. latest.json is never touched by a failed run.
-      - name: Commit data
-        id: commit
+          AGENTS_CORE_MAX_RUN_USD: ${{ inputs.max_run_usd }}
+        run: uv run agents-run "${{ inputs.agent }}" ${{ inputs.extra_args }}
+
+      # A failed run still updates manifest-entry.json (status: failed) and the cost
+      # log, so commit either way. latest.json is never touched by a failed run.
+      - name: Commit local run state
+        id: commit_state
         run: |
-          git config user.name "agents-hub[bot]"
+          set -euo pipefail
+          git config user.name "agents-core[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site/public/data data/
+          if [ -d data ]; then git add data/; fi
           if git diff --cached --quiet; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "data(${{ inputs.agent }}): run ${{ steps.agent.outcome }} $(date -u +%Y-%m-%dT%H:%MZ)"
+            for i in 1 2 3 4; do
+              git pull --rebase origin "${{ github.ref_name }}" && \
+                git push origin "HEAD:${{ github.ref_name }}" && break
+              sleep $((2 ** i))
+            done
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish data branch
+        if: hashFiles('public-data/**') != ''
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cp -r public-data/. "$tmp"/
+          git config user.name "agents-core[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan agents-core-data-publish
+          git rm -rf . >/dev/null 2>&1 || true
+          cp -r "$tmp"/. .
+          rm -rf "$tmp"
+          git add -A
+          git commit -m "data(${{ inputs.agent }}): publish $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --force origin agents-core-data-publish:data
+
+      - name: Notify site repo
+        if: inputs.site_repo != ''
+        env:
+          SITE_DISPATCH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SITE_DISPATCH_TOKEN:-}" ]; then
+            echo "SITE_DISPATCH_TOKEN not set; skipping site notification"
             exit 0
           fi
-          git commit -m "data(${{ inputs.agent }}): run ${{ steps.agent.outcome }} $(date -u +%Y-%m-%dT%H:%MZ)"
-          for i in 1 2 3 4; do
-            git pull --rebase origin main && git push origin HEAD:main && break
-            sleep $((2 ** i))
-          done
-          echo "committed=true" >> "$GITHUB_OUTPUT"
-      - name: Fail if the agent failed
+          curl -sf -X POST \
+            -H "Authorization: token ${SITE_DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ inputs.site_repo }}/dispatches" \
+            -d "$(jq -nc --arg agent '${{ inputs.agent }}' --arg repo '${{ github.repository }}' \
+                  '{event_type:"agent-data-updated", client_payload:{agent:$agent, repository:$repo}}')"
+
+      - name: Fail if the agent run failed
         if: steps.agent.outcome == 'failure'
         run: exit 1

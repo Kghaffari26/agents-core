@@ -1,10 +1,12 @@
 """The contract every agent implements, and the context the runner hands it.
 
-An agent lives in `agents/<id>/agent.py` and exposes a module-level `AGENT` instance.
-The runner calls fetch -> transform -> analyze; the agent never writes files itself.
+An agent repo registers a module-level `Agent` instance under the
+`agents_core.agents` entry-point group (see `agents_core.registry`) and depends on
+this package to get `agents-run <name>` for free. The runner calls
+fetch -> transform -> analyze; the agent never writes files itself.
 
     fetch(ctx)            download source data through ctx.http (cached, rate-limited)
-    transform(ctx, raw)   pure Python: compute every number the site shows. No LLM.
+    transform(ctx, raw)   pure Python: compute every number that gets published. No LLM.
     analyze(ctx, data)    LLM narrative via ctx.llm, returns an AgentResult
 
 `--dry-run` stops after transform, so fetch and transform must not call the LLM.
@@ -21,11 +23,11 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
 
-from core import settings
-from core.costs import CostTracker
-from core.http import Http
-from core.llm import LLM
-from core.schema import AgentOutput, KeyStat, Source
+from agents_core import settings
+from agents_core.costs import CostTracker
+from agents_core.http import Http
+from agents_core.llm import LLM
+from agents_core.schema import AgentOutput, KeyStat, Source
 
 
 @dataclass
@@ -38,12 +40,18 @@ class RunContext:
     costs: CostTracker
     dry_run: bool = False
     apply: bool = False
+    # Unrecognized `agents-run` CLI arguments, forwarded verbatim so an agent can
+    # define flags of its own (e.g. "--force-briefs") without this package knowing
+    # about them. Ignored unless the agent chooses to read it.
+    extra_args: list[str] = field(default_factory=list)
     log: logging.Logger = field(default_factory=lambda: logging.getLogger("agent"))
 
     def previous_latest(self) -> dict[str, Any] | None:
-        """The last published `latest.json` as a dict, or None. Use it to reuse narrative
+        """The previous `latest.json` as a dict, or None if there isn't one locally
+        (a fresh CI checkout normally won't have one unless the workflow first checks
+        out the agent's `data` branch into the publish dir). Use it to reuse narrative
         when source data hasn't changed (and set `data_changed=False`)."""
-        path = settings.publish_dir() / self.agent_id / "latest.json"
+        path = settings.publish_dir() / "latest.json"
         if not path.is_file():
             return None
         try:
@@ -57,9 +65,9 @@ class AgentResult:
     """What `analyze` returns. The runner adds `meta` and validates against output_model.
 
     `body` holds every top-level field of `latest.json` except `meta`.
-    `files` maps extra paths under the agent's data dir (e.g. "metros/austin-tx.json",
+    `files` maps extra paths under the publish dir (e.g. "metros/austin-tx.json",
     "all.json") to validated models; they are written before `latest.json`.
-    `headline` and `key_stats` feed the overview card and must be built
+    `headline` and `key_stats` feed an overview card and must be built
     deterministically from computed data, not by the LLM.
     """
 
@@ -86,13 +94,6 @@ class Agent(ABC):
 
     def configure_http(self, http: Http) -> None:  # noqa: B027 - optional hook
         """Register per-host rate limits and request budgets, e.g. SAM.gov's daily cap."""
-
-    def extra_models(self) -> dict[str, type[BaseModel]]:
-        """Models for files other than latest.json, keyed by schema name, for export.
-
-        Example: {"metro": MetroDetail} exports schemas/real_estate.metro.schema.json.
-        """
-        return {}
 
     @abstractmethod
     def fetch(self, ctx: RunContext) -> Any: ...

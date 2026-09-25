@@ -1,8 +1,15 @@
-"""Entry point: `python -m core.runner <agent> [--dry-run] [--apply]`.
+"""`agents-run <agent> [--dry-run] [--apply] [extra args...]` — the console command
+agents-core gives every agent repo for free, plus `agents_core.runner.main` for
+`python -m agents_core.runner`.
 
-fetch -> transform -> analyze -> validate -> publish. Any exception (including a
-failed validation or BudgetExceeded) fails the run: the previous latest.json is left
-untouched and the manifest entry is marked `failed`. Exit code 0 on success, 1 on failure.
+fetch -> transform -> analyze -> validate -> publish -> export schema. Any exception
+(including a failed validation or BudgetExceeded) fails the run: the previous
+latest.json is left untouched and manifest-entry.json is marked `failed`. Exit code 0
+on success, 1 on failure, 2 if the named agent isn't registered.
+
+Unrecognized arguments are forwarded verbatim as `ctx.extra_args`, so an agent can
+define flags of its own (e.g. a `--force-briefs`) without this package knowing about
+them.
 """
 
 from __future__ import annotations
@@ -15,14 +22,14 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
-from core import publish, registry, settings
-from core.agent import Agent, AgentResult, RunContext
-from core.costs import CostTracker
-from core.http import Http
-from core.llm import LLM
-from core.schema import AgentOutput, ManifestEntry, RunMeta
+from agents_core import costs, export_schemas, publish, registry, settings
+from agents_core.agent import Agent, AgentResult, RunContext
+from agents_core.costs import CostTracker
+from agents_core.http import Http
+from agents_core.llm import LLM
+from agents_core.schema import AgentOutput, ManifestEntry, RunMeta
 
-log = logging.getLogger("core.runner")
+log = logging.getLogger("agents_core.runner")
 
 
 def new_run_id(now: datetime) -> str:
@@ -84,7 +91,7 @@ def manifest_entry_for(
 def failed_entry(
     agent: Agent, previous: ManifestEntry | None, finished_at: datetime, cost_usd: float
 ) -> ManifestEntry:
-    """Keep the last good headline and stats; the site shows a failure banner."""
+    """Keep the last good headline and stats; a consuming site shows a failure banner."""
     if previous is not None:
         return previous.model_copy(
             update={"status": "failed", "last_run_at": finished_at, "run_cost_usd": cost_usd}
@@ -109,6 +116,7 @@ def run(
     *,
     dry_run: bool = False,
     apply: bool = False,
+    extra_args: list[str] | None = None,
     http: Http | None = None,
     llm_client: object | None = None,
 ) -> int:
@@ -127,6 +135,7 @@ def run(
         costs=tracker,
         dry_run=dry_run,
         apply=apply,
+        extra_args=extra_args or [],
         log=logging.getLogger(f"agents.{agent.id}"),
     )
     log.info(
@@ -152,11 +161,9 @@ def run(
         result = agent.analyze(ctx, data)
         finished = datetime.now(UTC)
         output = build_output(agent, result, ctx, finished)
-        entry = manifest_entry_for(agent, result, output, publish.previous_entry(agent.id))
-        publish.publish_output(
-            agent.id, output, files=result.files, history_keep=agent.history_keep
-        )
-        publish.upsert_manifest(entry)
+        entry = manifest_entry_for(agent, result, output, publish.read_previous_manifest_entry())
+        publish.publish_output(output, files=result.files, history_keep=agent.history_keep)
+        publish.write_manifest_entry(entry)
         status = result.status
         log.info("run %s published: status=%s cost=$%.4f", run_id, status, tracker.total_usd)
         return 0
@@ -164,37 +171,42 @@ def run(
         log.exception("run %s failed", run_id)
         if not dry_run:
             try:
-                previous = publish.previous_entry(agent.id)
-                publish.upsert_manifest(
+                previous = publish.read_previous_manifest_entry()
+                publish.write_manifest_entry(
                     failed_entry(agent, previous, datetime.now(UTC), round(tracker.total_usd, 4))
                 )
             except Exception:
-                log.exception("could not mark %s failed in manifest", agent.id)
+                log.exception("could not write manifest-entry.json for %s", agent.id)
         return 1
     finally:
-        if not dry_run or tracker.calls:
+        if not dry_run:
             tracker.record_run(status)
             try:
-                publish.write_cost_summary()
+                export_schemas.write_schema(agent.output_model)
             except Exception:
-                log.exception("could not write cost summary")
+                log.exception("could not write schema.json")
+            try:
+                costs.publish_costs_summary(agent.id, costs_path=tracker.path)
+            except Exception:
+                log.exception("could not write costs-summary.json")
         if own_http:
             http.close()
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m core.runner", description=__doc__)
-    parser.add_argument("agent", choices=registry.AGENT_IDS)
+    parser = argparse.ArgumentParser(prog="agents-run", description=__doc__)
+    parser.add_argument("agent", nargs="?", help="Registered agent name")
     parser.add_argument(
         "--dry-run", action="store_true", help="fetch + transform only; skip the LLM and publishing"
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="allow write actions (repo_maint only, allowlisted repos)",
+        help="allow live external changes; semantics are agent-specific",
     )
+    parser.add_argument("--list", action="store_true", help="list registered agents and exit")
     parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args(argv)
+    args, extra = parser.parse_known_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -203,12 +215,17 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # its logs include full URLs
     settings.load_dotenv()
 
+    if args.list or not args.agent:
+        for name, target in sorted(registry.discover_agents().items()):
+            print(f"{name} -> {target}")
+        return 0
+
     try:
         agent = registry.load(args.agent)
-    except registry.UnknownAgent as e:
+    except registry.AgentNotFound as e:
         log.error("%s", e)
         return 2
-    return run(agent, dry_run=args.dry_run, apply=args.apply)
+    return run(agent, dry_run=args.dry_run, apply=args.apply, extra_args=extra)
 
 
 if __name__ == "__main__":

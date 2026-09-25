@@ -227,7 +227,7 @@ def _is_float_list(x: Any) -> bool:
     return isinstance(x, list) and all(type(v) is float for v in x)
 
 
-# ---- guards for core.llm -----------------------------------------------------
+# ---- guards for agents_core.llm -----------------------------------------------------
 
 
 def text_guard(facts: Any, *, allow: Iterable[str] = ()) -> Callable[[str], GuardResult]:

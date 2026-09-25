@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from core.http import HostPolicy, Http, HttpError, RequestBudgetExceeded, redact_url
+from agents_core.http import HostPolicy, Http, HttpError, RequestBudgetExceeded, redact_url
 
 
 class Recorder:

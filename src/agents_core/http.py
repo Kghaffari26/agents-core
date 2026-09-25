@@ -21,7 +21,7 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 
-from core import settings
+from agents_core import settings
 
 log = logging.getLogger(__name__)
 

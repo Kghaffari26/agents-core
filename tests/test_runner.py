@@ -3,14 +3,14 @@ import re
 
 import pytest
 
-from core import runner
-from core.costs import BudgetExceeded
+from agents_core import runner
+from agents_core.costs import BudgetExceeded
 from tests.conftest import FakeClient, fake_message
 from tests.fake_agent import FakeAgent
 
 
-def data_dir(root):
-    return root / "site_data"
+def publish_root(root):
+    return root / "public_data"
 
 
 def run(agent, **kw):
@@ -21,8 +21,8 @@ def run(agent, **kw):
 def test_successful_run_publishes_everything(isolated_paths):
     agent = FakeAgent()
     assert run(agent) == 0
-    root = data_dir(isolated_paths)
-    latest = json.loads((root / "macro" / "latest.json").read_text())
+    root = publish_root(isolated_paths)
+    latest = json.loads((root / "latest.json").read_text())
     assert latest["headline_value"] == 4.0
     assert latest["brief"] == "Index rose."
     meta = latest["meta"]
@@ -32,55 +32,61 @@ def test_successful_run_publishes_everything(isolated_paths):
     assert meta["model_usage"]["smart"]["output_tokens"] == 200
     assert meta["started_at"].endswith("Z")
 
-    history = list((root / "macro" / "history").iterdir())
+    history = list((root / "history").iterdir())
     assert len(history) == 1
-    assert json.loads((root / "macro" / "series" / "us.json").read_text())["slug"] == "us"
+    assert json.loads((root / "series" / "us.json").read_text())["slug"] == "us"
 
-    manifest = json.loads((root / "manifest.json").read_text())
-    (e,) = manifest["agents"]
-    assert e["status"] == "ok" and e["headline"] == "Index at 4.0."
-    assert e["last_data_change_at"] == meta["finished_at"]
-    assert e["items_count"] == 1
+    entry = json.loads((root / "manifest-entry.json").read_text())
+    assert entry["status"] == "ok" and entry["headline"] == "Index at 4.0."
+    assert entry["last_data_change_at"] == meta["finished_at"]
+    assert entry["items_count"] == 1
 
-    summary = json.loads((root / "costs" / "summary.json").read_text())
-    assert summary["by_agent"][0]["agent"] == "macro" and summary["by_agent"][0]["runs"] == 1
+    summary = json.loads((root / "costs-summary.json").read_text())
+    assert summary["total_usd"] > 0 and summary["runs"] == 1
+
+    schema = json.loads((root / "schema.json").read_text())
+    assert schema["required"] == ["meta", "headline_value", "brief"]
 
 
 def test_unchanged_data_keeps_previous_change_time(isolated_paths):
     assert run(FakeAgent()) == 0
-    manifest_path = data_dir(isolated_paths) / "manifest.json"
-    first = json.loads(manifest_path.read_text())["agents"][0]
+    entry_path = publish_root(isolated_paths) / "manifest-entry.json"
+    first = json.loads(entry_path.read_text())
     assert run(FakeAgent(data_changed=False, use_llm=False), llm_client=FakeClient()) == 0
-    second = json.loads(manifest_path.read_text())["agents"][0]
+    second = json.loads(entry_path.read_text())
     assert second["last_data_change_at"] == first["last_data_change_at"]
     assert second["run_cost_usd"] == 0
 
 
 def test_invalid_output_fails_run_and_keeps_previous_latest(isolated_paths):
     assert run(FakeAgent()) == 0
-    latest_path = data_dir(isolated_paths) / "macro" / "latest.json"
+    latest_path = publish_root(isolated_paths) / "latest.json"
     before = latest_path.read_text()
 
     bad = FakeAgent(body={"headline_value": "not a number", "brief": "x"})
     assert run(bad) == 1
     assert latest_path.read_text() == before
-    (e,) = json.loads((data_dir(isolated_paths) / "manifest.json").read_text())["agents"]
-    assert e["status"] == "failed"
-    assert e["headline"] == "Index at 4.0."  # last good headline kept
+    entry = json.loads((publish_root(isolated_paths) / "manifest-entry.json").read_text())
+    assert entry["status"] == "failed"
+    assert entry["headline"] == "Index at 4.0."  # last good headline kept
 
 
 def test_failure_with_no_previous_run(isolated_paths):
     assert run(FakeAgent(fail_in="fetch")) == 1
-    root = data_dir(isolated_paths)
-    assert not (root / "macro" / "latest.json").exists()
-    (e,) = json.loads((root / "manifest.json").read_text())["agents"]
-    assert e["status"] == "failed" and e["last_data_change_at"] is None
+    root = publish_root(isolated_paths)
+    assert not (root / "latest.json").exists()
+    entry = json.loads((root / "manifest-entry.json").read_text())
+    assert entry["status"] == "failed" and entry["last_data_change_at"] is None
+    # Failed runs still publish a cost summary and a schema, since neither depends on
+    # the run having succeeded.
+    assert (root / "costs-summary.json").is_file()
+    assert (root / "schema.json").is_file()
 
 
 def test_budget_exceeded_fails_run(isolated_paths, monkeypatch):
-    monkeypatch.setenv("MAX_RUN_USD", "0.001")
+    monkeypatch.setenv("AGENTS_CORE_MAX_RUN_USD", "0.001")
     assert run(FakeAgent()) == 1
-    assert not (data_dir(isolated_paths) / "macro" / "latest.json").exists()
+    assert not (publish_root(isolated_paths) / "latest.json").exists()
 
 
 def test_dry_run_skips_llm_and_publish(isolated_paths):
@@ -89,19 +95,31 @@ def test_dry_run_skips_llm_and_publish(isolated_paths):
     assert runner.run(agent, dry_run=True, llm_client=client) == 0
     assert agent.calls == ["fetch", "transform"]
     assert client.messages.calls == []
-    assert not data_dir(isolated_paths).exists()
+    assert not publish_root(isolated_paths).exists()
     assert not (isolated_paths / "costs.jsonl").exists()
 
 
 def test_extra_meta_in_body_is_ignored_and_replaced(isolated_paths):
     body = {"headline_value": 1.0, "brief": "b", "meta": {"agent": "spoofed"}}
     assert run(FakeAgent(body=body)) == 0
-    latest = json.loads((data_dir(isolated_paths) / "macro" / "latest.json").read_text())
+    latest = json.loads((publish_root(isolated_paths) / "latest.json").read_text())
     assert latest["meta"]["agent"] == "macro"
 
 
-def test_cli_rejects_unimplemented_agent(capsys):
-    assert runner.main(["grants"]) == 2
+def test_cli_rejects_unregistered_agent(capsys):
+    assert runner.main(["not-a-registered-agent"]) == 2
+
+
+def test_cli_lists_agents_with_no_positional_arg(monkeypatch, capsys):
+    monkeypatch.setattr(runner.registry, "discover_agents", lambda: {"macro": "pkg.agent:AGENT"})
+    assert runner.main([]) == 0
+    assert "macro -> pkg.agent:AGENT" in capsys.readouterr().out
+
+
+def test_cli_list_flag(monkeypatch, capsys):
+    monkeypatch.setattr(runner.registry, "discover_agents", lambda: {"macro": "pkg.agent:AGENT"})
+    assert runner.main(["--list"]) == 0
+    assert "macro -> pkg.agent:AGENT" in capsys.readouterr().out
 
 
 def test_budget_exceeded_is_a_runtime_error():
@@ -109,7 +127,7 @@ def test_budget_exceeded_is_a_runtime_error():
 
 
 def test_history_is_trimmed(isolated_paths):
-    h = data_dir(isolated_paths) / "macro" / "history"
+    h = publish_root(isolated_paths) / "history"
     h.mkdir(parents=True)
     for d in ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"]:
         (h / f"{d}.json").write_text("{}")
@@ -128,3 +146,27 @@ def test_apply_flag_reaches_context(flag, isolated_paths):
 
     run(Probe(), apply=flag)
     assert seen["apply"] is flag
+
+
+def test_extra_args_reach_context(isolated_paths):
+    seen = {}
+
+    class Probe(FakeAgent):
+        def fetch(self, ctx):
+            seen["extra_args"] = ctx.extra_args
+            return super().fetch(ctx)
+
+    run(Probe(), extra_args=["--force-briefs", "x"])
+    assert seen["extra_args"] == ["--force-briefs", "x"]
+
+
+def test_extra_args_default_to_empty_list(isolated_paths):
+    seen = {}
+
+    class Probe(FakeAgent):
+        def fetch(self, ctx):
+            seen["extra_args"] = ctx.extra_args
+            return super().fetch(ctx)
+
+    run(Probe())
+    assert seen["extra_args"] == []

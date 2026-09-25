@@ -1,10 +1,14 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .pytest_cache/
 .ruff_cache/
-.cache/
 .env
-node_modules/
-site/.next/
-site/out/
+
+# Local run state and published output when developing against this repo directly
+# (e.g. running the entry-point test) — matches the default agents_core.settings paths.
+data/
+public-data/

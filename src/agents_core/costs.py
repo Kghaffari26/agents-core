@@ -1,25 +1,17 @@
-"""Token and USD accounting, the per-run budget cap, and the site's cost summary."""
+"""Token and USD accounting, the per-run budget cap, and the published cost summary."""
 
 from __future__ import annotations
 
 import json
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from core import settings
-from core.schema import (
-    AgentCost,
-    AvgRunCost,
-    CostSummary,
-    DailyCost,
-    ModelUsage,
-    TierUsage,
-    iso_z,
-)
+from agents_core import settings
+from agents_core.publish import write_json
+from agents_core.schema import CostsSummary, DailyCost, ModelUsage, TierUsage, iso_z
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +19,7 @@ Tier = Literal["fast", "smart"]
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised when a run's LLM spend would pass `MAX_RUN_USD`. Fails the run."""
+    """Raised when a run's LLM spend would pass MAX_RUN_USD. Fails the run."""
 
 
 @dataclass(frozen=True)
@@ -182,41 +174,55 @@ def read_log(path: Path | None = None) -> list[dict[str, Any]]:
     return entries
 
 
-def summarize(entries: list[dict[str, Any]], now: datetime | None = None) -> CostSummary:
-    """Aggregate the call log into the site's `costs/summary.json` (current UTC month)."""
+def summarize(
+    entries: list[dict[str, Any]], *, agent: str | None = None, now: datetime | None = None
+) -> CostsSummary:
+    """Roll up one agent's call log into a small `costs-summary.json` (current UTC month).
+
+    `agent`, when given, filters to that agent's lines only; omit it when `entries`
+    already covers a single agent's own log (the normal case: each agent repo has its
+    own `data/costs.jsonl`).
+    """
     now = now or datetime.now(UTC)
     month = now.strftime("%Y-%m")
 
     all_time = 0.0
-    month_by_agent: dict[str, float] = defaultdict(float)
-    month_runs: dict[str, set[str]] = defaultdict(set)
-    daily: dict[str, float] = defaultdict(float)
-    all_by_agent: dict[str, float] = defaultdict(float)
-    all_runs: dict[str, set[str]] = defaultdict(set)
+    month_total = 0.0
+    month_runs: set[str] = set()
+    daily: dict[str, float] = {}
 
     for e in entries:
-        # Call lines carry `usd`; run lines (kind=run) carry none, so they only count runs.
+        if agent is not None and e.get("agent") != agent:
+            continue
+        # Call lines carry `usd`; run lines (kind=run) carry none, so they add a run
+        # with no LLM calls to the count without affecting any total.
         usd = float(e.get("usd", 0))
-        agent, run_id, ts = e.get("agent", "?"), e.get("run_id", ""), e.get("ts", "")
+        run_id, ts = e.get("run_id", ""), e.get("ts", "")
         all_time += usd
-        all_by_agent[agent] += usd
-        all_runs[agent].add(run_id)
         if ts.startswith(month):
-            month_by_agent[agent] += usd
-            month_runs[agent].add(run_id)
-            daily[ts[:10]] += usd
+            month_total += usd
+            month_runs.add(run_id)
+            if usd:
+                daily[ts[:10]] = daily.get(ts[:10], 0.0) + usd
 
-    return CostSummary(
+    return CostsSummary(
         month=month,
-        total_usd=round(sum(month_by_agent.values()), 4),
-        by_agent=[
-            AgentCost(agent=a, usd=round(month_by_agent[a], 4), runs=len(month_runs[a]))
-            for a in sorted(month_by_agent)
-        ],
+        total_usd=round(month_total, 4),
+        runs=len(month_runs),
         daily=[DailyCost(date=d, usd=round(daily[d], 4)) for d in sorted(daily)],
         all_time_usd=round(all_time, 4),
-        avg_cost_per_run=[
-            AvgRunCost(agent=a, usd=round(all_by_agent[a] / len(all_runs[a]), 4))
-            for a in sorted(all_by_agent)
-        ],
     )
+
+
+def publish_costs_summary(
+    agent: str,
+    *,
+    costs_path: Path | None = None,
+    publish_dir: Path | str | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Write `<publish_dir>/costs-summary.json` for `agent`. Returns the byte size."""
+    entries = read_log(costs_path)
+    summary = summarize(entries, agent=agent, now=now)
+    base = Path(publish_dir) if publish_dir is not None else settings.publish_dir()
+    return write_json(base / "costs-summary.json", summary)

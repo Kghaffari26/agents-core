@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
-from core.schema import KeyStat, ManifestEntry, RunMeta, Source
+from agents_core.schema import KeyStat, ManifestEntry, RunMeta, Source
 
 
 def meta(**overrides):

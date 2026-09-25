@@ -10,11 +10,12 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point every writable path at tmp_path so tests never touch the repo."""
-    monkeypatch.setenv("PUBLISH_DIR", str(tmp_path / "site_data"))
-    monkeypatch.setenv("COSTS_PATH", str(tmp_path / "costs.jsonl"))
-    monkeypatch.setenv("HTTP_CACHE_DIR", str(tmp_path / "http_cache"))
-    monkeypatch.setenv("GUARD_FAILURES_PATH", str(tmp_path / "guard_failures.jsonl"))
-    monkeypatch.setenv("MAX_RUN_USD", "0.50")
+    monkeypatch.setenv("AGENTS_CORE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENTS_CORE_PUBLISH_DIR", str(tmp_path / "public_data"))
+    monkeypatch.setenv("AGENTS_CORE_COSTS_PATH", str(tmp_path / "costs.jsonl"))
+    monkeypatch.setenv("AGENTS_CORE_HTTP_CACHE_DIR", str(tmp_path / "http_cache"))
+    monkeypatch.setenv("AGENTS_CORE_GUARD_FAILURES_PATH", str(tmp_path / "guard_failures.jsonl"))
+    monkeypatch.setenv("AGENTS_CORE_MAX_RUN_USD", "0.50")
     return tmp_path
 
 

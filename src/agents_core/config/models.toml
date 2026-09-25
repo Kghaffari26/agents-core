@@ -1,20 +1,20 @@
-# Model tiers used by core/llm.py. Agents ask for a tier, never a model ID.
-# Verify IDs and prices at https://docs.claude.com before changing them.
+# Default model tiers and pricing, shipped with agents-core. An agent repo's own
+# config/models.toml overrides these keys (a deep merge, not a replace) — it only
+# needs to specify what it wants to change.
+#
+# VERIFY current model IDs, prices, and the batch discount rate at
+# https://docs.claude.com before relying on this for real budget math.
 
 [tiers.fast]
-# Extraction, classification, bulk scoring.
 model = "claude-haiku-4-5-20251001"
 max_tokens = 4096
 
 [tiers.smart]
-# Final narrative synthesis only.
 model = "claude-sonnet-5"
 max_tokens = 8000
-# Sonnet 5 runs adaptive thinking by default; effort bounds how much it spends.
 effort = "medium"
 
-# USD per million tokens. cache_write is the 5-minute TTL rate (1.25x input).
-# Batch requests are billed at batch_discount x these rates.
+# USD per million tokens. cache_write is the 5-minute TTL rate.
 [pricing]
 batch_discount = 0.5
 

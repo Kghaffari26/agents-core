@@ -5,10 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel
-
-from core.agent import Agent, AgentResult, RunContext
-from core.schema import AgentOutput, KeyStat, Model, Source
+from agents_core.agent import Agent, AgentResult, RunContext
+from agents_core.schema import AgentOutput, KeyStat, Model, Source
 
 
 class Point(Model):
@@ -49,9 +47,6 @@ class FakeAgent(Agent):
         self.data_changed = data_changed
         self.use_llm = use_llm
         self.calls: list[str] = []
-
-    def extra_models(self) -> dict[str, type[BaseModel]]:
-        return {"detail": Detail}
 
     def fetch(self, ctx: RunContext) -> Any:
         self.calls.append("fetch")
@@ -102,3 +97,8 @@ class FakeAgent(Agent):
             items_count=1,
             files={"series/us.json": Detail(slug="us", series=[Point(date="2026-08", value=4.0)])},
         )
+
+
+# A default instance, usable directly (as in most tests) or as an
+# `agents_core.agents` entry-point target for registry/CLI/install tests.
+AGENT = FakeAgent()

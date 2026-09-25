@@ -1,7 +1,10 @@
 """Shared pydantic models for every agent's published JSON.
 
-These shapes are the contract with the website (docs/specs/SPEC_WEBSITE.md §3).
-Change them only together with the site's generated types.
+`RunMeta`/`AgentOutput` are the base of `latest.json`. `ManifestEntry` and
+`CostsSummary` are the single-agent `manifest-entry.json` / `costs-summary.json`
+files each agent publishes at the root of its own data branch — see the README's
+data-branch contract. There is no cross-agent manifest here: assembling one across
+agents is the consuming website's job, not this package's.
 """
 
 from __future__ import annotations
@@ -118,31 +121,16 @@ class ManifestEntry(Model):
     items_count: int | None = None
 
 
-class Manifest(Model):
-    generated_at: Timestamp
-    agents: list[ManifestEntry]
-
-
-class AgentCost(Model):
-    agent: str
-    usd: float
-    runs: int
-
-
 class DailyCost(Model):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     usd: float
 
 
-class AvgRunCost(Model):
-    agent: str
-    usd: float
+class CostsSummary(Model):
+    """Published as `costs-summary.json`: this agent's own spend only."""
 
-
-class CostSummary(Model):
     month: str = Field(pattern=r"^\d{4}-\d{2}$")
     total_usd: float
-    by_agent: list[AgentCost]
+    runs: int
     daily: list[DailyCost]
     all_time_usd: float
-    avg_cost_per_run: list[AvgRunCost]

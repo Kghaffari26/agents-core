@@ -1,7 +1,7 @@
 import pytest
 from pydantic import BaseModel
 
-from core.guards import (
+from agents_core.guards import (
     collect_numbers,
     extract_numbers,
     fields_guard,

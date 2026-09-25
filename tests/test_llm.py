@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
-from core.costs import BudgetExceeded, CostTracker
-from core.llm import LLM, BatchItem, LLMError
+from agents_core.costs import BudgetExceeded, CostTracker
+from agents_core.llm import LLM, BatchItem, LLMError
 from tests.conftest import FakeBatches, FakeClient, fake_message
 
 
@@ -140,8 +140,8 @@ def test_missing_api_key_is_a_clear_error(monkeypatch):
 
 # ---- number guard -------------------------------------------------------------
 
-from core.guards import fields_guard, text_guard  # noqa: E402
-from core.llm import Guarded, GuardFailed  # noqa: E402
+from agents_core.guards import fields_guard, text_guard  # noqa: E402
+from agents_core.llm import Guarded, GuardFailed  # noqa: E402
 
 FACTS = {"cpi": 2.9, "payrolls": 142_000}
 

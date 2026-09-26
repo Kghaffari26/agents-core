@@ -40,7 +40,7 @@ def new_run_id(now: datetime) -> str:
 def build_output(
     agent: Agent, result: AgentResult, ctx: RunContext, finished_at: datetime
 ) -> AgentOutput:
-    meta = RunMeta(
+    core = RunMeta(
         agent=agent.id,
         schema_version=agent.schema_version,
         run_id=ctx.run_id,
@@ -51,14 +51,21 @@ def build_output(
         cost_usd=round(ctx.costs.total_usd, 6),
         model_usage=ctx.costs.model_usage(),
         sources=result.sources,
-    )
+        warnings=[*result.warnings, *(w for w in ctx.warnings if w not in result.warnings)],
+    ).model_dump(mode="json")
+    clash = sorted(set(result.meta_fields) & set(RunMeta.model_fields))
+    if clash:
+        raise ValueError(f"AgentResult.meta_fields may not set shared meta fields: {clash}")
+    # Validated by output_model, whose `meta` may be a RunMeta subclass declaring
+    # the agent's own meta fields.
+    meta = {**core, **result.meta_fields}
     body = (
         result.body.model_dump(mode="json")
         if isinstance(result.body, BaseModel)
         else dict(result.body)
     )
     body.pop("meta", None)
-    return agent.output_model.model_validate({**body, "meta": meta.model_dump(mode="json")})
+    return agent.output_model.model_validate({**body, "meta": meta})
 
 
 def manifest_entry_for(

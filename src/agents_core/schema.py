@@ -15,8 +15,15 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, PlainSerializer
 
 RunStatus = Literal["ok", "stale", "failed"]
-# "llm" when the narrative passed the number guard, "template" when the fallback ran.
+# "llm" when the narrative passed the number guard. "template" for every other
+# narrative: the guard's fallback, and any deterministic, non-LLM text an agent
+# builds itself (e.g. a --dry-run brief, or text reused because the model is skipped).
 NarrativeSource = Literal["llm", "template"]
+
+# Version of the shared `meta` block's own shape (independent of each agent's
+# `schema_version`, which versions the agent's whole latest.json). 1.1.0 added
+# `warnings` and `meta_schema_version`, and allowed agent-specific meta subclasses.
+META_SCHEMA_VERSION = "1.1.0"
 GoodDirection = Literal["up", "down", "neutral"]
 StatFormat = Literal[
     "currency_compact",
@@ -77,7 +84,13 @@ class ModelUsage(Model):
 
 
 class RunMeta(Model):
-    """The `meta` block at the top of every agent's `latest.json`."""
+    """The `meta` block at the top of every agent's `latest.json`.
+
+    Agent-specific meta fields: subclass `RunMeta` (fields need defaults), declare
+    `meta: MyMeta` on your `AgentOutput` subclass, and return the values in
+    `AgentResult.meta_fields`. The runner merges them into `meta` before validating,
+    so they're published in latest.json and appear in schema.json.
+    """
 
     agent: str
     schema_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
@@ -89,6 +102,10 @@ class RunMeta(Model):
     cost_usd: float = Field(ge=0)
     model_usage: ModelUsage
     sources: list[Source]
+    # Non-fatal problems in an otherwise usable run ("ok with a warning"), in plain
+    # language. From `AgentResult.warnings`.
+    warnings: list[str] = Field(default_factory=list)
+    meta_schema_version: str = Field(default=META_SCHEMA_VERSION, pattern=r"^\d+\.\d+\.\d+$")
 
 
 class AgentOutput(Model):

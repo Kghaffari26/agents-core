@@ -23,7 +23,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
 
-from agents_core import settings
+from agents_core import alerts, settings
 from agents_core.costs import CostTracker
 from agents_core.http import Http
 from agents_core.llm import LLM
@@ -45,12 +45,27 @@ class RunContext:
     # about them. Ignored unless the agent chooses to read it.
     extra_args: list[str] = field(default_factory=list)
     log: logging.Logger = field(default_factory=lambda: logging.getLogger("agent"))
+    # Collected by `warn()`; the runner publishes them (after AgentResult.warnings)
+    # as `meta.warnings`.
+    warnings: list[str] = field(default_factory=list)
+
+    def warn(self, message: str) -> None:
+        """Record a non-fatal problem ("ok with a warning"): logged now, and published
+        in `meta.warnings` if the run publishes."""
+        self.log.warning("%s", message)
+        self.warnings.append(message)
+
+    def alert(self, title: str, body: str, **kwargs: Any) -> alerts.AlertOutcome:
+        """Open or update one GitHub issue per `title` (at most once per 7 days).
+        A logged no-op without a token and repo; never raises. See `agents_core.alerts`."""
+        return alerts.ops_alert(title, body, http=self.http, **kwargs)
 
     def previous_latest(self) -> dict[str, Any] | None:
-        """The previous `latest.json` as a dict, or None if there isn't one locally
-        (a fresh CI checkout normally won't have one unless the workflow first checks
-        out the agent's `data` branch into the publish dir). Use it to reuse narrative
-        when source data hasn't changed (and set `data_changed=False`)."""
+        """The previous `latest.json` as a dict, or None if there isn't one (the first
+        run, or a local run with no publish dir). In CI the reusable workflow restores
+        the agent's `data` branch into the publish dir first, so this is the last
+        published output. Use it to reuse narrative when source data hasn't changed
+        (and set `data_changed=False`)."""
         path = settings.publish_dir() / "latest.json"
         if not path.is_file():
             return None
@@ -69,6 +84,10 @@ class AgentResult:
     "all.json") to validated models; they are written before `latest.json`.
     `headline` and `key_stats` feed an overview card and must be built
     deterministically from computed data, not by the LLM.
+    `warnings` are published as `meta.warnings` (plus anything passed to `ctx.warn`).
+    `meta_fields` are agent-specific `meta` values, merged into `meta` before
+    validation; declare them on a `RunMeta` subclass used as your output model's
+    `meta` type (see `agents_core.schema.RunMeta`).
     """
 
     body: dict[str, Any] | BaseModel
@@ -79,6 +98,8 @@ class AgentResult:
     items_count: int | None = None
     files: dict[str, BaseModel] = field(default_factory=dict)
     status: Literal["ok", "stale"] = "ok"
+    warnings: list[str] = field(default_factory=list)
+    meta_fields: dict[str, Any] = field(default_factory=dict)
 
 
 class Agent(ABC):

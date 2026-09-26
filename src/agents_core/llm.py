@@ -9,6 +9,13 @@ Numbers come from data, never from the model: pass computed figures in the promp
 ask for narrative only. Pass `guard=` (see core/guards.py) to check the narrative: a
 failing output is retried once with the unsupported numbers named, then replaced by
 `fallback()`. Guarded calls return `Guarded(value, narrative_source, ...)`.
+
+Sampling: a tier may set `temperature` in models.toml, and every call takes a
+`temperature=` override. Leave both unset for models that reject sampling
+parameters. Synchronous calls made together (`run_many`, `guard_batch` retries, a
+batch's `on_timeout="sync"` fallback) run on up to `max_concurrency` threads
+(`[llm] max_concurrency` in models.toml, the `LLM(max_concurrency=)` argument, or a
+per-call override); the default of 1 keeps them sequential.
 """
 
 from __future__ import annotations
@@ -16,11 +23,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import anthropic
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
@@ -36,6 +45,7 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 V = TypeVar("V")
+X = TypeVar("X")
 
 # Rough chars-per-token used only for the pre-call budget estimate.
 _CHARS_PER_TOKEN = 3.5
@@ -48,6 +58,10 @@ class LLMError(RuntimeError):
 
 class GuardFailed(LLMError):
     """The number guard failed twice and no fallback was given."""
+
+
+class BatchTimeout(LLMError):
+    """A batch didn't end within `timeout_seconds` (it has been cancelled)."""
 
 
 RETRY_INSTRUCTION = (
@@ -75,16 +89,25 @@ class TierConfig:
     max_tokens: int
     effort: str | None = None
     thinking: str | None = None  # "adaptive" | "disabled" | None (model default)
+    temperature: float | None = None  # None: not sent (the model's default)
 
 
 def tier_config(tier: Tier) -> TierConfig:
     cfg = settings.load_config("models")["tiers"][tier]
+    temperature = cfg.get("temperature")
     return TierConfig(
         model=cfg["model"],
         max_tokens=int(cfg["max_tokens"]),
         effort=cfg.get("effort"),
         thinking=cfg.get("thinking"),
+        temperature=None if temperature is None else float(temperature),
     )
+
+
+def default_max_concurrency() -> int:
+    """`[llm] max_concurrency` from models.toml (default 1: sequential)."""
+    value = settings.load_config("models").get("llm", {}).get("max_concurrency", 1)
+    return max(1, int(value))
 
 
 @dataclass(frozen=True)
@@ -99,6 +122,8 @@ class BatchResult[M: BaseModel]:
     custom_id: str
     value: M | str | None = None
     error: str | None = None
+    # "sync" when produced by run_many (including a batch's on_timeout="sync" fallback).
+    via: Literal["batch", "sync"] = "batch"
 
     @property
     def ok(self) -> bool:
@@ -112,10 +137,13 @@ class LLM:
         *,
         client: Any = None,
         sleep: Callable[[float], None] = time.sleep,
+        max_concurrency: int | None = None,
     ) -> None:
         self.tracker = tracker
         self._client = client
         self._sleep = sleep
+        self.max_concurrency = max_concurrency
+        self._log_lock = threading.Lock()
 
     @property
     def client(self) -> Any:
@@ -143,6 +171,7 @@ class LLM:
         prompt: str,
         context: str | None,
         max_tokens: int | None,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": cfg.model,
@@ -154,6 +183,9 @@ class LLM:
             params["output_config"] = {"effort": cfg.effort}
         if cfg.thinking:
             params["thinking"] = {"type": cfg.thinking}
+        temp = cfg.temperature if temperature is None else temperature
+        if temp is not None:
+            params["temperature"] = temp
         return params
 
     @staticmethod
@@ -183,14 +215,17 @@ class LLM:
         self, tier: Tier, params: dict[str, Any], output_model: type[T] | None, purpose: str
     ) -> Any:
         """One budget-checked, cost-logged call. Returns text, or the parsed model."""
-        self.tracker.check(self._estimate_usd(params))
-        if output_model is None:
-            message = self.client.messages.create(**params)
-        else:
-            message = self.client.messages.parse(output_format=output_model, **params)
-        self.tracker.record(
-            tier=tier, model=params["model"], usage=Usage.from_api(message.usage), purpose=purpose
-        )
+        with self.tracker.reserve(self._estimate_usd(params)):
+            if output_model is None:
+                message = self.client.messages.create(**params)
+            else:
+                message = self.client.messages.parse(output_format=output_model, **params)
+            self.tracker.record(
+                tier=tier,
+                model=params["model"],
+                usage=Usage.from_api(message.usage),
+                purpose=purpose,
+            )
         self._check_stop(message, purpose)
         if output_model is None:
             return self._text(message)
@@ -209,6 +244,7 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
+        temperature: float | None = None,
         guard: None = None,
         fallback: None = None,
     ) -> str: ...
@@ -223,6 +259,7 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
+        temperature: float | None = None,
         guard: Callable[[str], GuardResult],
         fallback: Callable[[], str] | None = None,
     ) -> Guarded[str]: ...
@@ -236,6 +273,7 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
+        temperature: float | None = None,
         guard: Callable[[str], GuardResult] | None = None,
         fallback: Callable[[], str] | None = None,
     ) -> str | Guarded[str]:
@@ -245,7 +283,12 @@ class LLM:
         """
         cfg = tier_config(tier)
         params = self._params(
-            cfg, system=system, prompt=prompt, context=context, max_tokens=max_tokens
+            cfg,
+            system=system,
+            prompt=prompt,
+            context=context,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         text = self._send(tier, params, None, purpose)
         if guard is None:
@@ -263,6 +306,7 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
+        temperature: float | None = None,
         guard: None = None,
         fallback: None = None,
     ) -> T: ...
@@ -278,6 +322,7 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
+        temperature: float | None = None,
         guard: Callable[[T], GuardResult],
         fallback: Callable[[], T] | None = None,
     ) -> Guarded[T]: ...
@@ -292,6 +337,7 @@ class LLM:
         context: str | None = None,
         max_tokens: int | None = None,
         purpose: str = "",
+        temperature: float | None = None,
         guard: Callable[[T], GuardResult] | None = None,
         fallback: Callable[[], T] | None = None,
     ) -> T | Guarded[T]:
@@ -301,7 +347,12 @@ class LLM:
         """
         cfg = tier_config(tier)
         params = self._params(
-            cfg, system=system, prompt=prompt, context=context, max_tokens=max_tokens
+            cfg,
+            system=system,
+            prompt=prompt,
+            context=context,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         parsed = self._send(tier, params, output_model, purpose)
         if guard is None:
@@ -387,10 +438,83 @@ class LLM:
         if error:
             entry["error"] = error
         path = settings.guard_failures_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+        with self._log_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
         log.warning("%s: number guard attempt %d failed: %s", purpose, attempt, unsupported)
+
+    # ---- concurrency ------------------------------------------------------
+
+    def _concurrency(self, override: int | None) -> int:
+        if override is not None:
+            return max(1, override)
+        if self.max_concurrency is not None:
+            return max(1, self.max_concurrency)
+        return default_max_concurrency()
+
+    def _map(
+        self, fn: Callable[[X], V], items: Sequence[X], max_concurrency: int | None
+    ) -> list[V]:
+        """`[fn(i) for i in items]`, on up to `max_concurrency` threads, in order.
+        The first exception (e.g. BudgetExceeded) cancels what hasn't started and
+        propagates."""
+        workers = min(self._concurrency(max_concurrency), len(items))
+        if workers <= 1:
+            return [fn(i) for i in items]
+        _ = self.client  # create the SDK client once, before any thread needs it
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agents-core-llm")
+        try:
+            futures = [pool.submit(fn, i) for i in items]
+            return [f.result() for f in futures]
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    # ---- many synchronous calls -------------------------------------------
+
+    def run_many(
+        self,
+        tier: Tier,
+        items: Sequence[BatchItem],
+        *,
+        system: str,
+        context: str | None = None,
+        output_model: type[T] | None = None,
+        purpose: str = "",
+        temperature: float | None = None,
+        max_concurrency: int | None = None,
+    ) -> dict[str, BatchResult[T]]:
+        """Run independent prompts as synchronous calls (full price), up to
+        `max_concurrency` at a time. Same inputs and result shape as `batch()` (results
+        carry `via="sync"`), so it's a drop-in fallback when a batch times out.
+
+        An unusable output (refusal, truncation, missing parse) becomes that item's
+        `error`; BudgetExceeded and API errors fail the whole call.
+        """
+        if not items:
+            return {}
+        ids = [i.custom_id for i in items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("custom_ids must be unique")
+        cfg = tier_config(tier)
+
+        def one(item: BatchItem) -> BatchResult[T]:
+            params = self._params(
+                cfg,
+                system=system,
+                prompt=item.prompt,
+                context=context,
+                max_tokens=item.max_tokens,
+                temperature=temperature,
+            )
+            try:
+                value = self._send(tier, params, output_model, f"{purpose}:{item.custom_id}")
+            except LLMError as e:
+                return BatchResult(item.custom_id, error=str(e), via="sync")
+            return BatchResult(item.custom_id, value=value, via="sync")
+
+        results = self._map(one, list(items), max_concurrency)
+        return {r.custom_id: r for r in results}
 
     # ---- batch ------------------------------------------------------------
 
@@ -405,12 +529,20 @@ class LLM:
         purpose: str = "",
         poll_seconds: float = 30.0,
         timeout_seconds: float = 3 * 3600,
+        temperature: float | None = None,
+        on_timeout: Literal["raise", "sync"] = "raise",
+        max_concurrency: int | None = None,
     ) -> dict[str, BatchResult[T]]:
         """Run many independent prompts through the Batch API (50% price, async).
 
         Blocks until the batch ends. Returns results keyed by custom_id; failed items
         carry `error` instead of `value`. The whole batch's worst-case cost is checked
         against the budget before submitting.
+
+        If the batch hasn't ended after `timeout_seconds` it's cancelled; then
+        `on_timeout="raise"` (the default) raises `BatchTimeout`, and `"sync"` reruns
+        every item through `run_many` (full price, `max_concurrency` at a time) and
+        returns those results, marked `via="sync"`.
         """
         if not items:
             return {}
@@ -428,6 +560,7 @@ class LLM:
                 prompt=item.prompt,
                 context=context,
                 max_tokens=item.max_tokens,
+                temperature=temperature,
             )
             if output_model is not None:
                 params["output_config"] = {
@@ -452,7 +585,26 @@ class LLM:
                 break
             if waited >= timeout_seconds:
                 self.client.messages.batches.cancel(created.id)
-                raise LLMError(f"{purpose}: batch {created.id} timed out after {waited:.0f}s")
+                if on_timeout == "sync":
+                    log.warning(
+                        "%s: batch %s timed out after %.0fs; cancelled, running %d items"
+                        " synchronously",
+                        purpose,
+                        created.id,
+                        waited,
+                        len(items),
+                    )
+                    return self.run_many(
+                        tier,
+                        items,
+                        system=system,
+                        context=context,
+                        output_model=output_model,
+                        purpose=purpose,
+                        temperature=temperature,
+                        max_concurrency=max_concurrency,
+                    )
+                raise BatchTimeout(f"{purpose}: batch {created.id} timed out after {waited:.0f}s")
             self._sleep(poll_seconds)
             waited += poll_seconds
 
@@ -510,18 +662,22 @@ class LLM:
         context: str | None = None,
         output_model: type[T] | None = None,
         purpose: str = "",
+        temperature: float | None = None,
+        max_concurrency: int | None = None,
     ) -> dict[str, Guarded[Any]]:
-        """Apply the number guard to `batch()` results, keyed by custom_id.
+        """Apply the number guard to `batch()` (or `run_many()`) results, keyed by custom_id.
 
         `guard(custom_id, value)` and `fallback(custom_id)` take the item's ID so each
         item can be checked against its own facts. A failing item is retried once
         synchronously (full price, counted toward MAX_RUN_USD) in the same conversation,
-        then falls back. Items that errored in the batch go straight to the fallback.
-        Pass the same `system`, `context` and `output_model` as the batch call.
+        then falls back; items are checked `max_concurrency` at a time, so `guard` and
+        `fallback` must be safe to call from several threads. Items that errored in the
+        batch go straight to the fallback. Pass the same `system`, `context`,
+        `output_model` and `temperature` as the batch call.
         """
         cfg = tier_config(tier)
-        guarded: dict[str, Guarded[Any]] = {}
-        for item in items:
+
+        def one(item: BatchItem) -> tuple[str, Guarded[Any]]:
             cid = item.custom_id
             res = results.get(cid)
             if res is None or not res.ok:
@@ -531,18 +687,23 @@ class LLM:
                     cid,
                     None if res is None else res.error,
                 )
-                guarded[cid] = Guarded(fallback(cid), "template", attempts=1)
-                continue
+                return cid, Guarded(fallback(cid), "template", attempts=1)
             params = self._params(
-                cfg, system=system, prompt=item.prompt, context=context, max_tokens=item.max_tokens
+                cfg,
+                system=system,
+                prompt=item.prompt,
+                context=context,
+                max_tokens=item.max_tokens,
+                temperature=temperature,
             )
-            guarded[cid] = self._guarded(
+            return cid, self._guarded(
                 tier,
                 params,
                 res.value,
-                lambda value, cid=cid: guard(cid, value),
-                lambda cid=cid: fallback(cid),
+                lambda value: guard(cid, value),
+                lambda: fallback(cid),
                 output_model,
                 f"{purpose}:{cid}",
             )
-        return guarded
+
+        return dict(self._map(one, list(items), max_concurrency))

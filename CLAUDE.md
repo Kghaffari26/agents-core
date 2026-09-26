@@ -18,7 +18,8 @@ agents-core/
 │   ├── runner.py                 # agents-run console script: fetch->transform->analyze->publish
 │   ├── llm.py                   # the ONLY place the Anthropic SDK is imported
 │   ├── guards.py                 # the number guard (verify_numbers, text_guard, fields_guard)
-│   ├── http.py                  # retries, rate limiting, request budgets, on-disk cache
+│   ├── http.py                  # retries, rate limiting, request budgets, on-disk cache, download()
+│   ├── alerts.py                # ops_alert / ctx.alert: one deduped GitHub issue per title
 │   ├── costs.py                  # CostTracker, BudgetExceeded, costs-summary.json
 │   ├── publish.py                # atomic JSON writes, dated history, manifest-entry.json
 │   ├── export_schemas.py        # schema.json, written automatically at publish time
@@ -27,7 +28,10 @@ agents-core/
 │   └── config/models.toml       # packaged default model tiers + pricing
 ├── tests/
 │   ├── fake_agent.py             # FakeAgent + module-level AGENT, used across most tests
-│   └── test_install_entry_point.py  # real uv sync + agents-run subprocess integration test
+│   ├── test_install_entry_point.py  # real uv sync + agents-run subprocess integration test
+│   └── test_run_agent_workflow.py   # run-agent.yml contract + its git scripts run for real
+├── CHANGELOG.md                 # one section per tagged version
+├── DECISIONS.md                 # one line per judgment call, per release
 ├── docs/specs/                  # historical, pre-package design specs — not current
 └── .github/workflows/
     ├── ci.yml                    # ruff + pytest + actionlint
@@ -56,16 +60,36 @@ agents-core/
 - **`run-agent.yml` is `workflow_call`-only.** It must never gain a `push`/
   `pull_request`/`schedule` trigger of its own — it only runs when another repo's
   workflow calls it.
+- **`run-agent.yml` declares no `permissions:`** (neither top-level nor on its job).
+  It inherits the calling job's grant; declaring any makes GitHub refuse to start
+  it for callers that grant less (e.g. repo-maintain's `issues: read` report job).
+  Document new permission needs in its header/README instead (current maximum:
+  `contents: write, issues: write, pull-requests: read, checks: read`).
+- **Never interpolate `${{ inputs.* }}` into a `run:` script** in run-agent.yml —
+  pass it through `env:` (a test enforces this).
+- **The data branch stays a single orphan commit of `public-data/` only**, restored
+  into `public-data/` before each run. Don't reintroduce `checkout --orphan` (it
+  can sweep untracked workspace files in).
+- **Ops alerts and request budgets must never break a run by themselves**: `alerts`
+  never raises; budgets count only requests actually sent, and budgeted hosts don't
+  retry unless their `HostPolicy.max_attempts` says so.
+- **`meta` is shared across four repos.** Additive fields only, with defaults, so
+  older `latest.json` files still validate; bump `schema.META_SCHEMA_VERSION`
+  (minor for additions) whenever `RunMeta` changes.
 - Every change to a public module (`agent.py`, `schema.py`, `llm.py`, `guards.py`,
   `registry.py`, `runner.py`, `publish.py`, `costs.py`, `export_schemas.py`,
-  `http.py`, `settings.py`) or to the data-branch contract is a breaking change for
-  four other repos — update `README.md`'s matching section in the same change.
+  `http.py`, `settings.py`, `alerts.py`) or to the data-branch contract is a breaking
+  change for four other repos — update `README.md`'s matching section and
+  `CHANGELOG.md` in the same change, and keep old callers working where possible
+  (add a "Migrating from" note to the README when they can't).
+- Log each judgment call as one line in `DECISIONS.md`.
 
 ## Commands
 
 ```bash
 uv sync                                    # install (editable)
-uv run pytest                              # tests, including the real install/entry-point test
+uv run pytest                              # tests, incl. the real install/entry-point test and
+                                           # run-agent.yml's git scripts against a local remote
 uv run ruff check .                        # lint
 uv run ruff format --check .               # format check
 /tmp/actionlint .github/workflows/*.yml    # or `actionlint` if on PATH
@@ -73,7 +97,8 @@ uv run ruff format --check .               # format check
 
 ## Releasing
 
-Agent repos and `run-agent.yml`'s own doc example pin a tag (`@v0.1.0`). Bump
-`pyproject.toml`'s `version`, then a human (not an agent session) tags and pushes:
-`git tag v0.1.0 && git push origin v0.1.0` — agent sessions in this repo should never
-push a tag themselves.
+Agent repos and `run-agent.yml`'s own doc example pin a tag (currently `@v0.2.0`).
+Bump `pyproject.toml`'s `version` and `agents_core.__version__`, run `uv lock`, add a
+`CHANGELOG.md` section, update the README's pins, then a human (not an agent session)
+tags and pushes: `git tag v0.2.0 && git push origin v0.2.0` — agent sessions in this
+repo should never push a tag themselves.

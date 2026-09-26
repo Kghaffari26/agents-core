@@ -10,15 +10,36 @@
 #     workflow_dispatch:
 #   jobs:
 #     run:
-#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.1.0
+#       permissions:
+#         contents: write        # always: commits data/, pushes the data branch
+#         issues: write          # only if the agent opens ops alerts or edits issues
+#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.2.0
 #       with:
 #         agent: macro
 #         site_repo: Kghaffari26/agents-hub   # optional
 #       secrets: inherit
 #
-# `secrets: inherit` passes through whichever of ANTHROPIC_API_KEY, FRED_API_KEY,
-# SAM_API_KEY, CENSUS_API_KEY, SITE_DISPATCH_TOKEN the caller has set — any of them
-# may be missing; this workflow never requires one that a given agent doesn't need.
+# Permissions: this workflow declares none of its own, so its job runs with exactly
+# the GITHUB_TOKEN permissions the calling job grants (a called workflow can never
+# exceed its caller's grant, and GitHub refuses to start one whose jobs request more
+# than that). The most any agent needs is:
+#
+#     contents: write, issues: write, pull-requests: read, checks: read
+#
+# Grant only what the agent uses, per calling job — `contents: write` is always
+# required. A least-privilege caller can split read-only and apply runs into two
+# jobs with different grants (e.g. `issues: read` vs `issues: write`), both calling
+# this workflow. A caller that grants nothing gets the repo's default token
+# permissions, which on new repos is read-only and makes the push steps fail.
+#
+# The agent step gets GITHUB_TOKEN (this run's token, with those permissions),
+# APPLY_CHANGES ("true"/"false", from the `apply_changes` input), and whichever of
+# the declared secrets below the caller passes (`secrets: inherit` passes all that
+# are set). Any secret may be missing; this workflow never requires one.
+#
+# Before the agent runs, the existing `data` branch (if any) is restored into
+# public-data/, so history/ accumulates across runs and ctx.previous_latest() and
+# manifest-entry.json see the previous run.
 name: Run agent
 on:
   workflow_call:
@@ -28,7 +49,9 @@ on:
         required: true
         type: string
       extra_args:
-        description: Extra arguments appended to `agents-run <agent>`, e.g. --force-briefs
+        description: >-
+          Extra arguments appended to `agents-run <agent>`, e.g. --force-briefs.
+          Split on whitespace; not evaluated by a shell.
         required: false
         type: string
         default: ""
@@ -51,11 +74,32 @@ on:
         required: false
         type: string
         default: ""
-permissions:
-  contents: write
+      apply_changes:
+        description: >-
+          Exported to the agent step as APPLY_CHANGES=true/false. Agent-specific: an
+          agent that makes external changes can require it (as well as --apply).
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      FRED_API_KEY:
+        required: false
+      SAM_API_KEY:
+        required: false
+      CENSUS_API_KEY:
+        required: false
+      REPO_MAINT_TOKEN:
+        required: false
+      SITE_DISPATCH_TOKEN:
+        required: false
 concurrency:
   group: agents-data-push-${{ github.repository }}
   cancel-in-progress: false
+env:
+  AGENT: ${{ inputs.agent }}
+  PUBLISH_DIR: public-data
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -75,6 +119,20 @@ jobs:
           key: ${{ github.repository }}-${{ inputs.agent }}-${{ github.run_id }}
           restore-keys: ${{ github.repository }}-${{ inputs.agent }}-
 
+      # The data branch is the last published output; it wins over anything cached or
+      # committed in public-data/.
+      - name: Restore previous data branch
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin data >/dev/null; then
+            git fetch --no-tags --depth=1 origin data
+            mkdir -p "$PUBLISH_DIR"
+            git archive FETCH_HEAD | tar -x -C "$PUBLISH_DIR"
+            echo "restored $(find "$PUBLISH_DIR" -type f | wc -l) files from the data branch"
+          else
+            echo "no data branch yet; starting from an empty $PUBLISH_DIR"
+          fi
+
       - run: uv sync
 
       - name: Run ${{ inputs.agent }}
@@ -85,13 +143,22 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
           CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+          REPO_MAINT_TOKEN: ${{ secrets.REPO_MAINT_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          APPLY_CHANGES: ${{ inputs.apply_changes }}
           AGENTS_CORE_MAX_RUN_USD: ${{ inputs.max_run_usd }}
-        run: uv run agents-run "${{ inputs.agent }}" ${{ inputs.extra_args }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          # shellcheck disable=SC2086 # EXTRA_ARGS is deliberately split on whitespace
+          uv run agents-run "$AGENT" $EXTRA_ARGS
 
       # A failed run still updates manifest-entry.json (status: failed) and the cost
       # log, so commit either way. latest.json is never touched by a failed run.
       - name: Commit local run state
         id: commit_state
+        env:
+          OUTCOME: ${{ steps.agent.outcome }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           git config user.name "agents-core[bot]"
@@ -100,35 +167,37 @@ jobs:
           if git diff --cached --quiet; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
           else
-            git commit -m "data(${{ inputs.agent }}): run ${{ steps.agent.outcome }} $(date -u +%Y-%m-%dT%H:%MZ)"
+            git commit -m "data($AGENT): run $OUTCOME $(date -u +%Y-%m-%dT%H:%MZ)"
             for i in 1 2 3 4; do
-              git pull --rebase origin "${{ github.ref_name }}" && \
-                git push origin "HEAD:${{ github.ref_name }}" && break
+              git pull --rebase --autostash origin "$BRANCH" && \
+                git push origin "HEAD:$BRANCH" && break
               sleep $((2 ** i))
             done
             echo "committed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Builds the commit from public-data/ alone, via a throwaway index, so nothing
+      # else in the workspace (.venv, .cache, the default branch's files) can leak in.
       - name: Publish data branch
         if: hashFiles('public-data/**') != ''
         run: |
           set -euo pipefail
-          tmp="$(mktemp -d)"
-          cp -r public-data/. "$tmp"/
           git config user.name "agents-core[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan agents-core-data-publish
-          git rm -rf . >/dev/null 2>&1 || true
-          cp -r "$tmp"/. .
-          rm -rf "$tmp"
-          git add -A
-          git commit -m "data(${{ inputs.agent }}): publish $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push --force origin agents-core-data-publish:data
+          GIT_INDEX_FILE="$(mktemp -u)"
+          export GIT_INDEX_FILE
+          git --work-tree="$PUBLISH_DIR" add --all --force .
+          tree="$(git write-tree)"
+          rm -f "$GIT_INDEX_FILE"
+          commit="$(git commit-tree "$tree" -m "data($AGENT): publish $(date -u +%Y-%m-%dT%H:%MZ)")"
+          git push --force origin "$commit:refs/heads/data"
 
       - name: Notify site repo
         if: inputs.site_repo != ''
         env:
           SITE_DISPATCH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          SITE_REPO: ${{ inputs.site_repo }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ -z "${SITE_DISPATCH_TOKEN:-}" ]; then
@@ -138,8 +207,8 @@ jobs:
           curl -sf -X POST \
             -H "Authorization: token ${SITE_DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ inputs.site_repo }}/dispatches" \
-            -d "$(jq -nc --arg agent '${{ inputs.agent }}' --arg repo '${{ github.repository }}' \
+            "https://api.github.com/repos/${SITE_REPO}/dispatches" \
+            -d "$(jq -nc --arg agent "$AGENT" --arg repo "$REPOSITORY" \
                   '{event_type:"agent-data-updated", client_payload:{agent:$agent, repository:$repo}}')"
 
       - name: Fail if the agent run failed

@@ -35,3 +35,10 @@ input = 2.00
 output = 10.00
 cache_write = 2.50
 cache_read = 0.20
+
+# Synchronous calls made together (LLM.run_many, guard_batch retries, a batch's
+# on_timeout="sync" fallback) run on up to this many threads; 1 = sequential.
+# A tier may also set `temperature` (omit it for models that reject sampling
+# parameters, which is why none of the defaults above set one).
+[llm]
+max_concurrency = 1

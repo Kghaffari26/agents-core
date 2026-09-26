@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,20 +95,46 @@ class CostTracker:
     total_usd: float = 0.0
     calls: int = 0
     _by_tier: dict[str, TierUsage] = field(default_factory=dict)
+    # Worst-case estimates of calls in flight (concurrent synchronous calls), so that
+    # parallel calls can't jointly overshoot the cap between check and record.
+    _reserved_usd: float = field(default=0.0, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def check(self, estimated_usd: float = 0.0) -> None:
-        """Raise before a call if spend so far plus `estimated_usd` would pass the cap."""
-        if self.total_usd + estimated_usd > self.max_usd:
-            raise BudgetExceeded(
-                f"{self.agent}: run spend ${self.total_usd:.4f} + estimated ${estimated_usd:.4f}"
-                f" would exceed MAX_RUN_USD ${self.max_usd:.2f}"
-            )
+        """Raise before a call if spend so far (plus calls in flight) plus
+        `estimated_usd` would pass the cap."""
+        with self._lock:
+            committed = self.total_usd + self._reserved_usd
+            if committed + estimated_usd > self.max_usd:
+                raise BudgetExceeded(
+                    f"{self.agent}: run spend ${committed:.4f} + estimated"
+                    f" ${estimated_usd:.4f} would exceed MAX_RUN_USD ${self.max_usd:.2f}"
+                )
+
+    @contextmanager
+    def reserve(self, estimated_usd: float) -> Iterator[None]:
+        """`check(estimated_usd)`, then hold that amount against the cap until the block
+        exits (record the call's actual cost inside the block)."""
+        with self._lock:
+            self.check(estimated_usd)
+            self._reserved_usd += estimated_usd
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._reserved_usd = max(self._reserved_usd - estimated_usd, 0.0)
 
     def record(
         self, *, tier: Tier, model: str, usage: Usage, batch: bool = False, purpose: str = ""
     ) -> float:
         """Log one call and add it to the run total. Raises BudgetExceeded once over the cap."""
         usd = usd_for(model, usage, batch=batch)
+        with self._lock:
+            return self._record_locked(tier, model, usage, usd, batch, purpose)
+
+    def _record_locked(
+        self, tier: Tier, model: str, usage: Usage, usd: float, batch: bool, purpose: str
+    ) -> float:
         self.total_usd += usd
         self.calls += 1
         tier_usage = self._by_tier.setdefault(tier, TierUsage())

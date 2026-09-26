@@ -44,6 +44,11 @@ def guard_failures_path() -> Path:
     return _path_from_env("AGENTS_CORE_GUARD_FAILURES_PATH", data_dir() / "guard_failures.jsonl")
 
 
+def ops_alerts_path() -> Path:
+    """When each ops-alert title last alerted (see `agents_core.alerts`)."""
+    return _path_from_env("AGENTS_CORE_OPS_ALERTS_PATH", data_dir() / "ops_alerts.json")
+
+
 def http_cache_dir() -> Path:
     # Deliberately outside data_dir(): CI commits data/ back to the caller's default
     # branch as run state, and the HTTP cache is a large, purely local dev convenience

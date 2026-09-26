@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 
-from agents_core import settings
+from agents_core import settings, tracing
 
 log = logging.getLogger(__name__)
 
@@ -261,16 +261,26 @@ class Http:
         host = urlsplit(url).netloc.lower()
         safe_url = redact_url(url, params)
 
-        if ttl > 0 and not refresh:
-            cached = self._cache_read(host, key, ttl)
-            if cached is not None and (cache_if is None or cache_if(cached)):
-                log.debug("cache hit %s", safe_url)
-                return cached
+        with tracing.span(
+            "http", f"{method.upper()} {host}", method=method.upper(), url=safe_url
+        ) as sp:
+            if ttl > 0 and not refresh:
+                cached = self._cache_read(host, key, ttl)
+                if cached is not None and (cache_if is None or cache_if(cached)):
+                    log.debug("cache hit %s", safe_url)
+                    sp.set(from_cache=True, status=cached.status, retries=0)
+                    return cached
 
-        response = self._send(method, url, host, safe_url, params, headers, json_body)
-        if ttl > 0 and 200 <= response.status < 300 and (cache_if is None or cache_if(response)):
-            self._cache_write(host, key, response)
-        return response
+            sp.set(from_cache=False)
+            response = self._send(method, url, host, safe_url, params, headers, json_body)
+            sp.set(status=response.status, bytes=len(response.content))
+            if (
+                ttl > 0
+                and 200 <= response.status < 300
+                and (cache_if is None or cache_if(response))
+            ):
+                self._cache_write(host, key, response)
+            return response
 
     def download(
         self,
@@ -342,10 +352,12 @@ class Http:
                     bytes=size,
                 )
 
-        try:
-            result = self._with_retries("GET", host, safe_url, attempt)
-        finally:
-            tmp.unlink(missing_ok=True)
+        with tracing.span("http", f"GET {host}", method="GET", url=safe_url, download=True) as sp:
+            try:
+                result = self._with_retries("GET", host, safe_url, attempt)
+            finally:
+                tmp.unlink(missing_ok=True)
+            sp.set(status=result.status, modified=result.modified, bytes=result.bytes)
         log.info(
             "GET %s -> %d (%s)",
             safe_url,
@@ -398,6 +410,7 @@ class Http:
         for attempt in range(1, max_attempts + 1):
             self._check_budget(host, policy)
             self._throttle(host, policy)
+            tracing.current_span().set(retries=attempt - 1)
             try:
                 result = attempt_fn()
             except _Retryable as e:

@@ -16,6 +16,9 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("AGENTS_CORE_HTTP_CACHE_DIR", str(tmp_path / "http_cache"))
     monkeypatch.setenv("AGENTS_CORE_GUARD_FAILURES_PATH", str(tmp_path / "guard_failures.jsonl"))
     monkeypatch.setenv("AGENTS_CORE_MAX_RUN_USD", "0.50")
+    monkeypatch.setenv("AGENTS_CORE_EVALS_DIR", str(tmp_path / "evals"))
+    monkeypatch.delenv("AGENTS_CORE_EVAL_MAX_USD", raising=False)
+    monkeypatch.delenv("AGENTS_CORE_TRACE_MAX_BYTES", raising=False)
     return tmp_path
 
 

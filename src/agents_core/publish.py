@@ -8,7 +8,9 @@ force-pushes to the agent's own `data` branch as a single orphan commit):
     ├── history/YYYY-MM-DD.json
     ├── manifest-entry.json
     ├── costs-summary.json       (written by agents_core.costs.publish_costs_summary)
-    └── schema.json              (written by agents_core.export_schemas.write_schema)
+    ├── schema.json              (written by agents_core.export_schemas.write_schema)
+    ├── trace.json               (written by agents_core.tracing.write_trace)
+    └── trace.schema.json        (written by agents_core.export_schemas.write_trace_schema)
 
 `publish_dir` defaults to `agents_core.settings.publish_dir()` (itself `public-data/`,
 or `$AGENTS_CORE_PUBLISH_DIR`) — nothing here assumes any particular website's layout,
@@ -40,7 +42,14 @@ log = logging.getLogger(__name__)
 LATEST_SIZE_WARN_BYTES = 300_000
 _HISTORY_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
 _RESERVED_NAMES = frozenset(
-    {"latest.json", "manifest-entry.json", "costs-summary.json", "schema.json"}
+    {
+        "latest.json",
+        "manifest-entry.json",
+        "costs-summary.json",
+        "schema.json",
+        "trace.json",
+        "trace.schema.json",
+    }
 )
 
 

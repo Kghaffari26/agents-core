@@ -104,3 +104,23 @@ def test_publish_costs_summary_writes_file(isolated_paths):
     data = json.loads(path.read_text())
     assert data["month"] == datetime.now(UTC).strftime("%Y-%m")
     assert data["total_usd"] > 0
+
+
+# ---- SpendScope (v0.3.0) --------------------------------------------------------------
+
+
+def test_spend_scope_counts_only_spend_since_it_opened():
+    from agents_core.costs import ScopeBudgetExceeded, SpendScope
+
+    tracker = CostTracker(agent="a", run_id="r", max_usd=1.0)
+    tracker.record(tier="smart", model="claude-sonnet-5", usage=Usage(output_tokens=10_000))
+    scope = SpendScope(tracker, 0.25, label="loop")
+    assert scope.spent == 0 and scope.remaining == 0.25
+    scope.check(0.25)
+    tracker.record(tier="smart", model="claude-sonnet-5", usage=Usage(output_tokens=10_000))
+    assert scope.spent == pytest.approx(0.1)
+    with pytest.raises(ScopeBudgetExceeded, match="loop"):
+        scope.check(0.2)
+    assert issubclass(ScopeBudgetExceeded, BudgetExceeded)
+    with pytest.raises(ValueError):
+        SpendScope(tracker, -1)

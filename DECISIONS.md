@@ -2,6 +2,46 @@
 
 One line per judgment call, newest release first.
 
+## v0.3.0
+
+- Built on v0.2.0 as released (main == tag v0.2.0 == 50cf3f9); everything is additive, so `meta_schema_version` stays 1.1.0 (RunMeta is unchanged) and old manifest entries still validate (`trace_summary` defaults to null).
+- The loop is a manual loop over a new `LLM.converse()` rather than the SDK's beta tool runner, so the Anthropic import stays in llm.py and the loop can enforce budgets, approvals and replay between turns.
+- `max_usd` is enforced by a new `costs.SpendScope` (a sub-budget measured as the run tracker's spend since the loop started) whose `check()` runs with the same worst-case estimate `LLM` already uses, before `tracker.reserve()`; a scope stop raises `ScopeBudgetExceeded(BudgetExceeded)` internally so the loop can tell it apart from MAX_RUN_USD.
+- Hitting MAX_RUN_USD inside a loop is also a graceful stop (`stop_reason="run_budget"`) rather than a run failure, since the spec asks for partial results on budget exhaustion; nothing over the cap is ever sent because the check is pre-call.
+- `end_turn` without `finish` is a hard failure with no nudge/retry, as specified; `pause_turn` is resent as-is; `refusal` and `max_tokens` stop the loop (a truncated turn may hold a truncated tool call).
+- When `finish` appears in a turn, tool calls before it in the same turn run and calls after it are dropped; `finish` with invalid input or a failing guard is answered with an `is_error` tool_result so the model can retry within the step budget.
+- Tool timeouts run each call on a daemon thread and abandon it on timeout (Python can't kill threads); documented that tools should be idempotent reads. The per-call timeout is also clamped to the loop's remaining wall-clock budget.
+- Untrusted delimiters are a fixed tag (`<untrusted-tool-output tool="...">`) with any occurrence of the tag inside the output defused, plus a system-prompt notice; tool *errors* are wrapped too (exception text can carry fetched content), the loop's own messages (validation, allowlist, approval) are not.
+- Approval-gated calls get a non-error tool_result telling the model the action was queued; `PendingAction.id` is the tool_use id; `execute_approved()` re-validates input and is traced with `approved=True`.
+- A tool not on the per-run allowlist is neither offered nor executable (an error result if the model calls it anyway); `finish` is reserved and always offered.
+- Tool definitions are sent sorted by name and cache breakpoints go on system/context, the last tool and the last message (3 of the 4 allowed), so each turn reads the previous ones from cache.
+- `tool_choice` is left at the API default (auto): forced tool choice returns 400 on newer models, and the finish requirement is carried by the system prompt instead.
+- Replay: the loop records each response (content blocks as plain dicts, stop reason, usage, and what the request offered); `ReplayClient(strict=True)` checks tool names and message count per request instead of whole-request equality, so replays survive prompt wording changes but catch control-flow divergence.
+- Trace nesting is by `parent_id` in a flat span list (not nested JSON), which keeps the JSON Schema non-recursive and lets the size cap drop whole spans.
+- Tracing uses `contextvars` (no global tracer); `LLM._map` and tool threads run in `copy_context()` so spans made on worker threads nest under the caller's span. `tracing.span()` is a no-op without an active tracer, so library use outside the runner is unaffected.
+- The first guarded call's `llm_call` span precedes its `guard` span; only the retry nests inside the guard (the guard can't start before there's output to check).
+- Batch calls get one `llm_call` span with summed tokens/USD (not one per item); SDK-internal retries of Anthropic calls aren't visible to us, so `retries` is recorded on `http` spans only.
+- Prompts and completions are never recorded in spans (size and leakage); tool inputs and a 500-char output preview are.
+- Redaction is key-based (a key *ending* in api_key/token/secret/password/authorization/cookie/..., so `input_tokens` survives), pattern-based (sk-ant-, sk-, gh*_, github_pat_, AKIA, xox*, JWTs, bearer/basic tokens, secret query params) and value-based (literal values ≥8 chars of env vars named *KEY/*TOKEN/*SECRET/*PASSWORD/*CREDENTIAL).
+- Size cap default 256 KB (`AGENTS_CORE_TRACE_MAX_BYTES`): shorten strings to 2000/500/120 chars first, then keep the largest prefix of spans that fits; the summary is computed before any truncation so `trace_summary` is exact.
+- `trace.json` is written after failed runs too (not after dry runs, which publish nothing); `trace.schema.json` is published beside it rather than folded into `schema.json`, which stays the agent's own `latest.json` schema.
+- `trace_summary` has exactly the six requested fields; `steps` counts agent-loop model turns, `total_latency_ms` sums root spans, `guard_retries` sums `attempts - 1` over guard spans.
+- Runner phases (fetch/transform/analyze/publish) got their own `phase` spans, an extra span kind beyond the five requested, so latency is attributable.
+- Evals results are one file per UTC date holding that day's latest report per suite (`{"date", "suites": {name: report}}`), so several suites (or reruns) on one day don't overwrite each other.
+- `compare` without `--suite` only compares suites whose latest entry shares the git SHA of the history's last line, so an old regression in a suite that wasn't re-run isn't re-reported; `pass_rate` is compared as a score too; a missing baseline is not a regression.
+- A spend-cap-truncated eval run is flagged in the report, history and markdown but not failed by `compare` on its own; its partial scores still count toward regressions.
+- The eval spend cap uses its own `CostTracker` (`data/eval_costs.jsonl`) with `max_usd` = the cap, so judge calls count too and the existing pre-call reserve prevents overshoot.
+- LLM judge: 1-5 verdict via structured output on the `fast` tier, normalized to (score-1)/4; calibration reports agreement at the pass threshold, MAE, bias and Pearson correlation, and `offset_adjust()` is the provided correction hook.
+- Scorers are small classes named in lower case (`exact(...)`, `numeric(...)`) so suites read like function calls; any `(case, out, ctx) -> Score` callable works.
+- Git SHA for history: `AGENTS_CORE_GIT_SHA`, then `git rev-parse HEAD`, then `GITHUB_SHA`.
+- run-evals.yml runs `eval_command` via `bash -c "$EVAL_COMMAND"` from env (never interpolated): it's the caller's own command from its own workflow file, like a `run:` line.
+- run-evals.yml re-checks changed paths itself (`paths` input, fnmatch globs against `git diff base...HEAD`) because a called workflow can't declare its own `pull_request` trigger; the caller's `paths:` filter remains the primary filter.
+- run-evals.yml declares no permissions (like run-agent.yml) and only reads `ANTHROPIC_API_KEY`; the summary goes to `$GITHUB_STEP_SUMMARY`, which needs no token permission (no PR comment, which would need `pull-requests: write`).
+- New console script `agents-evals` (subcommands `run`, `compare`) rather than more `agents-run` flags, keeping the runner's CLI unchanged.
+- The README's complete example agent is executed by `tests/test_readme_example.py`; doing so caught that a $0.05 loop budget can never fit one worst-case smart-tier call at 8000 max_tokens, so the example sets `max_tokens=2000` and the README documents the pitfall.
+- Tests stay SDK-free like the existing suite; `converse()`'s handling of real SDK content blocks (thinking signatures preserved) was checked once by hand against `anthropic.types.Message`.
+- Pushed to `main` as instructed (and mirrored to the session branch); no tag created — a human tags v0.3.0.
+
 ## v0.2.0
 
 - Gaps were taken from the four agent repos' STATUS.md "agents-core gaps / Needed from agents-core" sections (cloned read-only); every item there is addressed, including sam-agent's minor "budget day should be UTC".

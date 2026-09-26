@@ -10,7 +10,7 @@ agents is the consuming website's job, not this package's.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, PlainSerializer
 
@@ -123,6 +123,19 @@ class KeyStat(Model):
     good_direction: GoodDirection = "neutral"
 
 
+class TraceSummary(Model):
+    """Roll-up of one run's trace, published in `manifest-entry.json` (see
+    `agents_core.tracing`). `steps` counts agent-loop model turns; `guard_retries`
+    counts number-guard retries (a guard that passed first time adds 0)."""
+
+    steps: int = 0
+    tool_calls: int = 0
+    llm_calls: int = 0
+    total_latency_ms: float = 0.0
+    cost_usd: float = 0.0
+    guard_retries: int = 0
+
+
 class ManifestEntry(Model):
     id: str
     name: str
@@ -136,6 +149,8 @@ class ManifestEntry(Model):
     key_stats: list[KeyStat] = Field(max_length=4)
     run_cost_usd: float = Field(ge=0)
     items_count: int | None = None
+    # Added in agents-core v0.3.0; None in entries written by older versions.
+    trace_summary: TraceSummary | None = None
 
 
 class DailyCost(Model):
@@ -151,3 +166,35 @@ class CostsSummary(Model):
     runs: int
     daily: list[DailyCost]
     all_time_usd: float
+
+
+# ---- trace.json (agents_core.tracing) ----------------------------------------------
+
+TRACE_SCHEMA_VERSION = "1.0.0"
+SpanKind = Literal["run", "phase", "agent_loop", "llm_call", "tool_call", "http", "guard", "custom"]
+
+
+class TraceSpan(Model):
+    """One timed operation. Nesting is by `parent_id` (None for a root span)."""
+
+    id: str
+    parent_id: str | None
+    kind: SpanKind
+    name: str
+    started_at: str = Field(description="UTC, ISO 8601 with milliseconds")
+    duration_ms: float | None = Field(description="None if the span never ended")
+    status: Literal["ok", "error"] = "ok"
+    error: str | None = None
+    attrs: dict[str, Any] = Field(default_factory=dict)
+
+
+class Trace(Model):
+    """Published as `trace.json`: one run's spans, secrets redacted, size-capped."""
+
+    trace_schema_version: str = TRACE_SCHEMA_VERSION
+    agent: str
+    run_id: str
+    summary: TraceSummary
+    spans: list[TraceSpan]
+    truncated: bool = False
+    dropped_spans: int = 0

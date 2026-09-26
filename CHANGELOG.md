@@ -1,8 +1,90 @@
 # Changelog
 
 All notable changes to agents-core. Versions are git tags on this repo
-(`@vX.Y.Z`); agent repos pin one. See the README's "Migrating from v0.1.0"
-section for upgrade steps.
+(`@vX.Y.Z`); agent repos pin one. See the README's "Migrating from ..." sections
+for upgrade steps.
+
+## v0.3.0 — 2026-09-26
+
+The agentic building blocks: a budgeted tool-use loop, run tracing, and an eval
+harness with a reusable PR gate. Additive — every v0.2.0 call still works, and
+`latest.json`/`meta` are unchanged. See the README's "Migrating from v0.2.0".
+
+### Agent loop (`agents_core.agent_loop`, new)
+
+- `AgentLoop`: a tool-use loop on the Messages API. Tools are typed functions with a
+  pydantic input model (`@tool`), with a per-run allowlist (`allowed_tools`).
+- Budgets (`LoopBudget`): `max_steps`, `max_usd` (enforced through the new
+  `costs.SpendScope`, with a worst-case check before every call) and `max_seconds`.
+  Budget exhaustion — including the run-wide MAX_RUN_USD — returns a graceful
+  partial `LoopResult` with a `stop_reason`, never an exception.
+- Stop conditions: a required `finish` tool whose input validates as the
+  `result_model`; `end_turn` without `finish` is a failure; refusals and truncation
+  stop the loop.
+- Tool outputs and errors are wrapped in `<untrusted-tool-output>` delimiters
+  (delimiters inside are defused) and the system prompt says they're data.
+- Per-tool timeouts; exceptions, timeouts and invalid inputs are sent back to the
+  model as `is_error` tool results (`ToolError` for clean messages).
+- `requires_approval=True` tools are recorded as `PendingAction`s instead of
+  executed; the loop continues or stops (`on_approval`); `execute_approved()` runs
+  one after a human approves.
+- The number guard can check the `finish` result (`guard=`, `fallback=`,
+  `guard_retries=`), logged to `guard_failures.jsonl` like other guards.
+- Deterministic replay: every response is recorded in `LoopResult.trajectory`;
+  `ReplayClient` replays a saved `Trajectory` (strict mode detects divergence).
+- `LLM.converse()`: one budget-checked, cost-logged, traced request in a
+  caller-managed conversation (cache breakpoints on system, tools and the last
+  message), returning a `Turn` with plain-dict content blocks. `LLM.estimate_usd()`.
+
+### Tracing (`agents_core.tracing`, new)
+
+- Nested spans (`run`, `phase`, `agent_loop`, `llm_call`, `tool_call`, `http`,
+  `guard`, `custom`) recording tokens, USD, latency, retries, stop reasons and
+  guard outcomes. `agents_core.llm`, `agents_core.http` and the agent loop emit
+  them automatically; the runner traces every run, with a span per phase.
+  `RunContext.tracer` added.
+- `trace.json` is written to the publish dir after every non-dry run (failed runs
+  included): secrets redacted (secret-looking keys, known credential formats,
+  secret query params, secret env var values), size-capped at
+  `AGENTS_CORE_TRACE_MAX_BYTES` (default 256 KB).
+
+### Data-branch contract
+
+- New files `trace.json` and `trace.schema.json` (`schema.Trace`; also
+  `python -m agents_core.export_schemas --trace`). Both are reserved names for
+  `AgentResult.files`.
+- `manifest-entry.json` gains `trace_summary` (`steps`, `tool_calls`, `llm_calls`,
+  `total_latency_ms`, `cost_usd`, `guard_retries`); `null` in older entries.
+
+### Evals (`agents_core.evals`, new)
+
+- `EvalSuite`/`EvalCase`/`run_suite` with scorers `exact`, `numeric`,
+  `set_overlap`, trajectory scorers `required_tools_called`,
+  `forbidden_tools_not_called`, `max_steps`, `stop_reason`, and `LLMJudge` (rubric,
+  1-5 verdict normalized to 0..1) with `calibrate()` against human labels and an
+  `adjust=` hook.
+- Spend cap (`--max-usd`, `EvalSuite.max_usd`, `AGENTS_CORE_EVAL_MAX_USD`, default
+  $1.00); `evals/results/<date>.json`; `evals/history.jsonl` lines with
+  prompt_version, git SHA, model(s), scores, pass rate and cost.
+- `agents-evals run module:SUITE` and `agents-evals compare` (markdown deltas,
+  exit 1 on regressions beyond `--threshold`). New console script `agents-evals`.
+
+### Reusable workflows
+
+- New `run-evals.yml` (`workflow_call` only, no declared permissions): inputs
+  `eval_command`, `max_usd`, `regression_threshold`, `history_path`, `paths`,
+  `python_version`; skips PRs that touch none of `paths`, writes the comparison to
+  the job summary, fails on regressions.
+- `run-agent.yml`: doc pins bumped to `@v0.3.0`; no behaviour change.
+
+### Other
+
+- `costs.SpendScope` / `ScopeBudgetExceeded` (a `BudgetExceeded` subclass): a
+  sub-budget on a run's tracker.
+- `settings.evals_dir()` (`AGENTS_CORE_EVALS_DIR`, default `evals/`) and
+  `settings.eval_max_usd()`.
+- LLM calls made on worker threads (`run_many`, `guard_batch`) run in a copy of the
+  caller's context, so their spans nest correctly.
 
 ## v0.2.0 — 2026-09-26
 

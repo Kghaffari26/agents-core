@@ -16,10 +16,16 @@ parameters. Synchronous calls made together (`run_many`, `guard_batch` retries, 
 batch's `on_timeout="sync"` fallback) run on up to `max_concurrency` threads
 (`[llm] max_concurrency` in models.toml, the `LLM(max_concurrency=)` argument, or a
 per-call override); the default of 1 keeps them sequential.
+
+Multi-turn tool use: `converse()` sends one request of a conversation you manage
+(messages + tool definitions) and returns a `Turn` with plain-dict content blocks;
+`agents_core.agent_loop` is built on it. Every call opens an `llm_call` span (and
+every guarded call a `guard` span) on the active tracer — see `agents_core.tracing`.
 """
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -36,8 +42,8 @@ from anthropic.types.message_create_params import MessageCreateParamsNonStreamin
 from anthropic.types.messages.batch_create_params import Request
 from pydantic import BaseModel, ValidationError
 
-from agents_core import settings
-from agents_core.costs import CostTracker, Tier, Usage, usd_for
+from agents_core import settings, tracing
+from agents_core.costs import CostTracker, SpendScope, Tier, Usage, usd_for
 from agents_core.guards import GuardResult
 from agents_core.schema import NarrativeSource, iso_z
 
@@ -81,6 +87,79 @@ class Guarded[R]:
     narrative_source: NarrativeSource
     attempts: int
     unsupported: list[str] = field(default_factory=list)
+
+
+def _plain(obj: Any) -> Any:
+    """SDK objects (pydantic models) or test doubles -> plain JSON-like values."""
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list | tuple):
+        return [_plain(v) for v in obj]
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(mode="json", exclude_none=True)
+    if hasattr(obj, "__dict__") and not isinstance(obj, type):
+        return {
+            k: _plain(v) for k, v in vars(obj).items() if not k.startswith("_") and v is not None
+        }
+    return obj
+
+
+@dataclass(frozen=True)
+class Turn:
+    """One `converse()` response. `content` holds the response's content blocks as
+    plain dicts — append `{"role": "assistant", "content": turn.content}` to the
+    conversation unchanged (thinking blocks included) before the next request."""
+
+    content: list[dict[str, Any]]
+    stop_reason: str | None
+    usage: Usage
+    usd: float
+    model: str
+    refusal_category: str | None = None
+
+    @property
+    def text(self) -> str:
+        return "".join(b.get("text", "") for b in self.content if b.get("type") == "text").strip()
+
+    @property
+    def tool_uses(self) -> list[dict[str, Any]]:
+        return [b for b in self.content if b.get("type") == "tool_use"]
+
+
+def _usage_attrs(usage: Usage) -> dict[str, int]:
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+    }
+
+
+def _with_message_breakpoint(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A copy of `messages` with a cache breakpoint on the last block, so each turn of
+    a growing conversation reads the previous turns from the prompt cache."""
+    if not messages:
+        return messages
+    last = dict(messages[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return messages
+    # Thinking blocks and empty text blocks can't carry a breakpoint.
+    eligible = [
+        i
+        for i, b in enumerate(content)
+        if isinstance(b, dict)
+        and b.get("type") not in ("thinking", "redacted_thinking")
+        and not (b.get("type") == "text" and not b.get("text"))
+    ]
+    if not eligible:
+        return messages
+    blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+    blocks[eligible[-1]]["cache_control"] = {"type": "ephemeral"}
+    last["content"] = blocks
+    return [*messages[:-1], last]
 
 
 @dataclass(frozen=True)
@@ -191,7 +270,11 @@ class LLM:
     @staticmethod
     def _estimate_usd(params: dict[str, Any], *, batch: bool = False) -> float:
         """Worst-case cost: all input uncached, output runs to max_tokens."""
-        chars = len(json.dumps(params["system"])) + len(json.dumps(params["messages"]))
+        chars = (
+            len(json.dumps(params["system"]))
+            + len(json.dumps(params["messages"]))
+            + len(json.dumps(params.get("tools", [])))
+        )
         worst = Usage(
             input_tokens=int(chars / _CHARS_PER_TOKEN), output_tokens=params["max_tokens"]
         )
@@ -215,24 +298,95 @@ class LLM:
         self, tier: Tier, params: dict[str, Any], output_model: type[T] | None, purpose: str
     ) -> Any:
         """One budget-checked, cost-logged call. Returns text, or the parsed model."""
-        with self.tracker.reserve(self._estimate_usd(params)):
-            if output_model is None:
-                message = self.client.messages.create(**params)
-            else:
-                message = self.client.messages.parse(output_format=output_model, **params)
-            self.tracker.record(
-                tier=tier,
-                model=params["model"],
-                usage=Usage.from_api(message.usage),
-                purpose=purpose,
-            )
-        self._check_stop(message, purpose)
+        with tracing.span(
+            "llm_call", purpose or tier, tier=tier, model=params["model"], purpose=purpose
+        ) as sp:
+            estimate = self._estimate_usd(params)
+            sp.set(estimated_usd=round(estimate, 6))
+            with self.tracker.reserve(estimate):
+                if output_model is None:
+                    message = self.client.messages.create(**params)
+                else:
+                    message = self.client.messages.parse(output_format=output_model, **params)
+                usage = Usage.from_api(message.usage)
+                sp.set(
+                    **_usage_attrs(usage),
+                    usd=round(usd_for(params["model"], usage), 6),
+                    stop_reason=message.stop_reason,
+                )
+                self.tracker.record(tier=tier, model=params["model"], usage=usage, purpose=purpose)
+            self._check_stop(message, purpose)
         if output_model is None:
             return self._text(message)
         parsed = getattr(message, "parsed_output", None)
         if parsed is None:
             raise LLMError(f"{purpose}: no parsed output returned")
         return parsed
+
+    def estimate_usd(self, params: dict[str, Any]) -> float:
+        """Worst-case USD for a request built by this class (all input uncached,
+        output runs to max_tokens)."""
+        return self._estimate_usd(params)
+
+    def converse(
+        self,
+        tier: Tier,
+        messages: list[dict[str, Any]],
+        *,
+        system: str,
+        context: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int | None = None,
+        purpose: str = "",
+        temperature: float | None = None,
+        budget: SpendScope | None = None,
+    ) -> Turn:
+        """One request in a multi-turn conversation you manage (e.g. a tool-use loop).
+
+        `tools` are Messages API tool definitions (`name`, `description`,
+        `input_schema`). Cache breakpoints go on the system/context block, the last
+        tool, and the last message. Before sending, the worst-case cost is checked
+        against `budget` (a `SpendScope`, raising `ScopeBudgetExceeded`) and reserved
+        against MAX_RUN_USD (raising `BudgetExceeded`); either way nothing is sent.
+        Stop reasons are returned, not raised — the caller decides what a refusal or
+        truncation means.
+        """
+        cfg = tier_config(tier)
+        params = self._params(
+            cfg,
+            system=system,
+            prompt="",
+            context=context,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        params["messages"] = _with_message_breakpoint(messages)
+        if tools:
+            tool_defs = [dict(t) for t in tools]
+            tool_defs[-1]["cache_control"] = {"type": "ephemeral"}
+            params["tools"] = tool_defs
+        with tracing.span(
+            "llm_call", purpose or tier, tier=tier, model=cfg.model, purpose=purpose
+        ) as sp:
+            estimate = self._estimate_usd(params)
+            sp.set(estimated_usd=round(estimate, 6))
+            if budget is not None:
+                budget.check(estimate)
+            with self.tracker.reserve(estimate):
+                message = self.client.messages.create(**params)
+                usage = Usage.from_api(message.usage)
+                usd = usd_for(cfg.model, usage)
+                sp.set(**_usage_attrs(usage), usd=round(usd, 6), stop_reason=message.stop_reason)
+                self.tracker.record(tier=tier, model=cfg.model, usage=usage, purpose=purpose)
+        details = getattr(message, "stop_details", None)
+        return Turn(
+            content=[_plain(b) for b in message.content],
+            stop_reason=message.stop_reason,
+            usage=usage,
+            usd=usd,
+            model=cfg.model,
+            refusal_category=getattr(details, "category", None) if details else None,
+        )
 
     @overload
     def complete(
@@ -372,6 +526,31 @@ class LLM:
         purpose: str,
     ) -> Guarded[V]:
         """Check `first`; on failure retry once in the same conversation, then fall back."""
+        with tracing.span("guard", purpose or tier, purpose=purpose) as sp:
+            guarded = self._guarded_inner(
+                tier, params, first, guard, fallback, output_model, purpose
+            )
+            sp.set(
+                attempts=guarded.attempts,
+                outcome=(
+                    "fallback"
+                    if guarded.narrative_source == "template"
+                    else ("pass" if guarded.attempts == 1 else "pass_after_retry")
+                ),
+                unsupported=guarded.unsupported,
+            )
+            return guarded
+
+    def _guarded_inner(
+        self,
+        tier: Tier,
+        params: dict[str, Any],
+        first: V,
+        guard: Callable[[V], GuardResult],
+        fallback: Callable[[], V] | None,
+        output_model: type[T] | None,
+        purpose: str,
+    ) -> Guarded[V]:
         result = guard(first)
         if result.ok:
             return Guarded(first, "llm", attempts=1)
@@ -402,6 +581,7 @@ class LLM:
             unsupported = result.unsupported
 
         if fallback is None:
+            tracing.current_span().set(attempts=2, outcome="failed", unsupported=unsupported)
             raise GuardFailed(f"{purpose}: unsupported numbers after retry: {unsupported}")
         log.warning("%s: number guard failed twice; using template fallback", purpose)
         return Guarded(fallback(), "template", attempts=2, unsupported=unsupported)
@@ -465,7 +645,8 @@ class LLM:
         _ = self.client  # create the SDK client once, before any thread needs it
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agents-core-llm")
         try:
-            futures = [pool.submit(fn, i) for i in items]
+            # Each item runs in a copy of this context, so its spans nest under ours.
+            futures = [pool.submit(contextvars.copy_context().run, fn, i) for i in items]
             return [f.result() for f in futures]
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -549,6 +730,41 @@ class LLM:
         ids = [i.custom_id for i in items]
         if len(set(ids)) != len(ids):
             raise ValueError("batch custom_ids must be unique")
+        with tracing.span(
+            "llm_call", purpose or f"{tier} batch", tier=tier, purpose=purpose, batch=True
+        ) as sp:
+            sp.set(items=len(items))
+            return self._batch(
+                tier,
+                items,
+                ids,
+                system=system,
+                context=context,
+                output_model=output_model,
+                purpose=purpose,
+                poll_seconds=poll_seconds,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+                on_timeout=on_timeout,
+                max_concurrency=max_concurrency,
+            )
+
+    def _batch(
+        self,
+        tier: Tier,
+        items: Sequence[BatchItem],
+        ids: list[str],
+        *,
+        system: str,
+        context: str | None,
+        output_model: type[T] | None,
+        purpose: str,
+        poll_seconds: float,
+        timeout_seconds: float,
+        temperature: float | None,
+        on_timeout: Literal["raise", "sync"],
+        max_concurrency: int | None,
+    ) -> dict[str, BatchResult[T]]:
 
         cfg = tier_config(tier)
         requests = []
@@ -630,11 +846,16 @@ class LLM:
             detail = getattr(getattr(entry.result, "error", None), "type", entry.result.type)
             return BatchResult(cid, error=str(detail))
         message = entry.result.message
+        usage = Usage.from_api(message.usage)
+        sp = tracing.current_span().set(model=model)
+        for key, value in _usage_attrs(usage).items():
+            sp.add(key, value)
+        sp.add("usd", round(usd_for(model, usage, batch=True), 6))
         # Record before validating: the tokens were billed either way.
         self.tracker.record(
             tier=tier,
             model=model,
-            usage=Usage.from_api(message.usage),
+            usage=usage,
             batch=True,
             purpose=f"{purpose}:{cid}",
         )

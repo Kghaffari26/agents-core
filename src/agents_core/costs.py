@@ -25,6 +25,11 @@ class BudgetExceeded(RuntimeError):
     """Raised when a run's LLM spend would pass MAX_RUN_USD. Fails the run."""
 
 
+class ScopeBudgetExceeded(BudgetExceeded):
+    """Raised by `SpendScope.check` when a call would pass a sub-budget (e.g. one
+    agent loop's or one eval suite's `max_usd`). The run-level cap still applies too."""
+
+
 @dataclass(frozen=True)
 class Price:
     """USD per million tokens."""
@@ -187,6 +192,41 @@ class CostTracker:
             fast=self._by_tier.get("fast", TierUsage()).model_copy(),
             smart=self._by_tier.get("smart", TierUsage()).model_copy(),
         )
+
+
+class SpendScope:
+    """A sub-budget inside a run: `max_usd` of spend on `tracker`, counted from now.
+
+    `LLM.converse(..., budget=scope)` calls `check(worst_case_estimate)` before every
+    request, so a call that *could* push the scope past `max_usd` is never sent. Spend
+    is measured as the tracker's total since the scope opened, so concurrent calls on
+    the same tracker count against it too.
+    """
+
+    def __init__(self, tracker: CostTracker, max_usd: float, *, label: str = "scope") -> None:
+        if max_usd < 0:
+            raise ValueError("max_usd must be >= 0")
+        self.tracker = tracker
+        self.max_usd = max_usd
+        self.label = label
+        self._start = tracker.total_usd
+
+    @property
+    def spent(self) -> float:
+        return max(self.tracker.total_usd - self._start, 0.0)
+
+    @property
+    def remaining(self) -> float:
+        return max(self.max_usd - self.spent, 0.0)
+
+    def check(self, estimated_usd: float = 0.0) -> None:
+        """Raise `ScopeBudgetExceeded` if spend so far plus `estimated_usd` would pass
+        `max_usd`."""
+        if self.spent + estimated_usd > self.max_usd:
+            raise ScopeBudgetExceeded(
+                f"{self.label}: spend ${self.spent:.4f} + estimated ${estimated_usd:.4f}"
+                f" would exceed its budget ${self.max_usd:.2f}"
+            )
 
 
 def read_log(path: Path | None = None) -> list[dict[str, Any]]:

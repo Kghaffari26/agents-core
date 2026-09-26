@@ -1,0 +1,129 @@
+# Reusable: run an agent repo's evals on a pull request, write a markdown summary with
+# score deltas to the job summary, and fail on regressions beyond a threshold.
+#
+# `workflow_call` only — an agent repo calls it from its own PR workflow. Put the
+# path filter on the caller's trigger so the job only starts for PRs that touch
+# prompts or agent code; the `paths` input below re-checks the PR's changed files
+# as a second line of defence (and so a caller without a filter still skips):
+#
+#   name: Evals
+#   on:
+#     pull_request:
+#       paths: ["prompts/**", "src/**", "evals/**", "config/models.toml"]
+#   jobs:
+#     evals:
+#       permissions:
+#         contents: read
+#       uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.0
+#       with:
+#         eval_command: uv run agents-evals run fed_agent.evals:SUITE
+#         max_usd: "1.00"
+#         regression_threshold: "0.05"
+#       secrets: inherit
+#
+# Permissions: like run-agent.yml, this workflow declares none of its own, so its
+# job runs with exactly the GITHUB_TOKEN permissions the calling job grants. It
+# needs only `contents: read` (checkout); the job summary needs no permission.
+#
+# `eval_command` runs through `bash -c` in the caller's checkout (it's the caller's
+# own command, like a `run:` line in its workflow). It must append to the history
+# file — `agents-evals run` and `agents_core.evals.run_suite` do — which the
+# compare step then reads: the latest entry of each suite just run is compared with
+# the previous entry, which is normally the one committed on the base branch.
+name: Run evals
+on:
+  workflow_call:
+    inputs:
+      eval_command:
+        description: Command that runs the evals and appends to the history file
+        required: true
+        type: string
+      max_usd:
+        description: Eval spend cap in USD (AGENTS_CORE_EVAL_MAX_USD)
+        required: false
+        type: string
+        default: "1.00"
+      regression_threshold:
+        description: Fail when any score drops by more than this (0-1 scale)
+        required: false
+        type: string
+        default: "0.05"
+      history_path:
+        description: The eval history file the command appends to
+        required: false
+        type: string
+        default: evals/history.jsonl
+      paths:
+        description: >-
+          Space-separated glob patterns (fnmatch; `*` also matches `/`). On a
+          pull_request event, evals run only if a changed file matches one.
+          Empty: always run.
+        required: false
+        type: string
+        default: "prompts/* src/* evals/* config/*"
+      python_version:
+        required: false
+        type: string
+        default: "3.12"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed paths
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PATTERNS: ${{ inputs.paths }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ] || [ -z "$PATTERNS" ] || [ -z "$BASE_SHA" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
+          run="$(CHANGED="$changed" python3 -c '
+          import fnmatch, os
+          files = os.environ["CHANGED"].split()
+          pats = os.environ["PATTERNS"].split()
+          print("true" if any(fnmatch.fnmatch(f, p) for f in files for p in pats) else "false")
+          ')"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "false" ]; then
+            echo "No changed file matches: $PATTERNS — skipping evals." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.changes.outputs.run == 'true'
+        with:
+          enable-cache: true
+          python-version: ${{ inputs.python_version }}
+
+      - if: steps.changes.outputs.run == 'true'
+        run: uv sync
+
+      - name: Run evals
+        if: steps.changes.outputs.run == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AGENTS_CORE_EVAL_MAX_USD: ${{ inputs.max_usd }}
+          EVAL_COMMAND: ${{ inputs.eval_command }}
+        run: bash -c "$EVAL_COMMAND"
+
+      - name: Compare with previous results
+        if: steps.changes.outputs.run == 'true'
+        env:
+          HISTORY_PATH: ${{ inputs.history_path }}
+          THRESHOLD: ${{ inputs.regression_threshold }}
+        run: |
+          set -euo pipefail
+          uv run agents-evals compare --history "$HISTORY_PATH" --threshold "$THRESHOLD" \
+            --markdown "$GITHUB_STEP_SUMMARY"

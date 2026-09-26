@@ -13,7 +13,7 @@
 #       permissions:
 #         contents: write        # always: commits data/, pushes the data branch
 #         issues: write          # only if the agent opens ops alerts or edits issues
-#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.2.0
+#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.0
 #       with:
 #         agent: macro
 #         site_repo: Kghaffari26/agents-hub   # optional
@@ -39,7 +39,8 @@
 #
 # Before the agent runs, the existing `data` branch (if any) is restored into
 # public-data/, so history/ accumulates across runs and ctx.previous_latest() and
-# manifest-entry.json see the previous run.
+# manifest-entry.json see the previous run. Since agents-core v0.3.0 the published
+# tree also holds trace.json and trace.schema.json (see the README).
 name: Run agent
 on:
   workflow_call:

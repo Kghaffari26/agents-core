@@ -2,7 +2,10 @@
 agents-core gives every agent repo for free, plus `agents_core.runner.main` for
 `python -m agents_core.runner`.
 
-fetch -> transform -> analyze -> validate -> publish -> export schema. Any exception
+fetch -> transform -> analyze -> validate -> publish -> export schema + trace. The
+whole run is traced (see `agents_core.tracing`): `trace.json` is written to the publish
+dir after every non-dry run, failed ones included, and its summary goes into
+manifest-entry.json as `trace_summary`. Any exception
 (including a failed validation or BudgetExceeded) fails the run: the previous
 latest.json is left untouched and manifest-entry.json is marked `failed`. Exit code 0
 on success, 1 on failure, 2 if the named agent isn't registered.
@@ -22,12 +25,12 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
-from agents_core import costs, export_schemas, publish, registry, settings
+from agents_core import costs, export_schemas, publish, registry, settings, tracing
 from agents_core.agent import Agent, AgentResult, RunContext
 from agents_core.costs import CostTracker
 from agents_core.http import Http
 from agents_core.llm import LLM
-from agents_core.schema import AgentOutput, ManifestEntry, RunMeta
+from agents_core.schema import AgentOutput, ManifestEntry, RunMeta, TraceSummary
 
 log = logging.getLogger("agents_core.runner")
 
@@ -73,6 +76,7 @@ def manifest_entry_for(
     result: AgentResult,
     output: AgentOutput,
     previous: ManifestEntry | None,
+    trace_summary: TraceSummary | None = None,
 ) -> ManifestEntry:
     finished = output.meta.finished_at
     if result.data_changed:
@@ -92,16 +96,26 @@ def manifest_entry_for(
         key_stats=result.key_stats,
         run_cost_usd=round(output.meta.cost_usd, 4),
         items_count=result.items_count,
+        trace_summary=trace_summary,
     )
 
 
 def failed_entry(
-    agent: Agent, previous: ManifestEntry | None, finished_at: datetime, cost_usd: float
+    agent: Agent,
+    previous: ManifestEntry | None,
+    finished_at: datetime,
+    cost_usd: float,
+    trace_summary: TraceSummary | None = None,
 ) -> ManifestEntry:
     """Keep the last good headline and stats; a consuming site shows a failure banner."""
     if previous is not None:
         return previous.model_copy(
-            update={"status": "failed", "last_run_at": finished_at, "run_cost_usd": cost_usd}
+            update={
+                "status": "failed",
+                "last_run_at": finished_at,
+                "run_cost_usd": cost_usd,
+                "trace_summary": trace_summary,
+            }
         )
     return ManifestEntry(
         id=agent.id,
@@ -115,6 +129,7 @@ def failed_entry(
         headline="No successful run yet.",
         key_stats=[],
         run_cost_usd=cost_usd,
+        trace_summary=trace_summary,
     )
 
 
@@ -130,6 +145,7 @@ def run(
     started = datetime.now(UTC)
     run_id = new_run_id(started)
     tracker = CostTracker(agent=agent.id, run_id=run_id)
+    tracer = tracing.Tracer(agent=agent.id, run_id=run_id)
     own_http = http is None
     http = http or Http()
     agent.configure_http(http)
@@ -144,6 +160,7 @@ def run(
         apply=apply,
         extra_args=extra_args or [],
         log=logging.getLogger(f"agents.{agent.id}"),
+        tracer=tracer,
     )
     log.info(
         "run %s: %s%s%s",
@@ -153,51 +170,97 @@ def run(
         " (apply)" if apply else "",
     )
 
-    status = "failed"
     try:
-        raw = agent.fetch(ctx)
-        data = agent.transform(ctx, raw)
+        with tracing.use(tracer), tracer.span("run", agent.id, run_id=run_id) as run_span:
+            status = _run_traced(agent, ctx, tracker, tracer, http, dry_run=dry_run)
+            run_span.set(status=status)
+        if not dry_run:
+            _write_run_files(agent, tracker, tracer, status)
+        return 1 if status == "failed" else 0
+    finally:
+        if own_http:
+            http.close()
+
+
+def _write_run_files(
+    agent: Agent, tracker: CostTracker, tracer: tracing.Tracer, status: str
+) -> None:
+    """Written after every non-dry run, failed or not; none of them can fail the run."""
+    tracker.record_run(status)
+    try:
+        export_schemas.write_schema(agent.output_model)
+    except Exception:
+        log.exception("could not write schema.json")
+    try:
+        costs.publish_costs_summary(agent.id, costs_path=tracker.path)
+    except Exception:
+        log.exception("could not write costs-summary.json")
+    try:
+        tracing.write_trace(tracer)
+        export_schemas.write_trace_schema()
+    except Exception:
+        log.exception("could not write trace.json")
+
+
+def _run_traced(
+    agent: Agent,
+    ctx: RunContext,
+    tracker: CostTracker,
+    tracer: tracing.Tracer,
+    http: Http,
+    *,
+    dry_run: bool,
+) -> str:
+    """fetch -> transform -> analyze -> publish. Returns the run status ("failed" on
+    any exception, which is logged, never raised)."""
+    try:
+        with tracing.span("phase", "fetch"):
+            raw = agent.fetch(ctx)
+        with tracing.span("phase", "transform"):
+            data = agent.transform(ctx, raw)
         if dry_run:
             log.info("dry run: %s", agent.summarize_dry_run(data))
             log.info(
                 "dry run: %d network requests; skipping LLM and publish", http.network_requests
             )
-            status = "dry_run"
-            return 0
+            return "dry_run"
 
-        result = agent.analyze(ctx, data)
-        finished = datetime.now(UTC)
-        output = build_output(agent, result, ctx, finished)
-        entry = manifest_entry_for(agent, result, output, publish.read_previous_manifest_entry())
-        publish.publish_output(output, files=result.files, history_keep=agent.history_keep)
-        publish.write_manifest_entry(entry)
-        status = result.status
-        log.info("run %s published: status=%s cost=$%.4f", run_id, status, tracker.total_usd)
-        return 0
-    except Exception:
-        log.exception("run %s failed", run_id)
+        with tracing.span("phase", "analyze"):
+            result = agent.analyze(ctx, data)
+        with tracing.span("phase", "publish"):
+            finished = datetime.now(UTC)
+            output = build_output(agent, result, ctx, finished)
+            entry = manifest_entry_for(
+                agent,
+                result,
+                output,
+                publish.read_previous_manifest_entry(),
+                trace_summary=tracer.summary(),
+            )
+            publish.publish_output(output, files=result.files, history_keep=agent.history_keep)
+            publish.write_manifest_entry(entry)
+        log.info(
+            "run %s published: status=%s cost=$%.4f", ctx.run_id, result.status, tracker.total_usd
+        )
+        return result.status
+    except Exception as e:
+        tracing.current_span().fail(e)
+        log.exception("run %s failed", ctx.run_id)
         if not dry_run:
             try:
                 previous = publish.read_previous_manifest_entry()
                 publish.write_manifest_entry(
-                    failed_entry(agent, previous, datetime.now(UTC), round(tracker.total_usd, 4))
+                    failed_entry(
+                        agent,
+                        previous,
+                        datetime.now(UTC),
+                        round(tracker.total_usd, 4),
+                        trace_summary=tracer.summary(),
+                    )
                 )
             except Exception:
                 log.exception("could not write manifest-entry.json for %s", agent.id)
-        return 1
-    finally:
-        if not dry_run:
-            tracker.record_run(status)
-            try:
-                export_schemas.write_schema(agent.output_model)
-            except Exception:
-                log.exception("could not write schema.json")
-            try:
-                costs.publish_costs_summary(agent.id, costs_path=tracker.path)
-            except Exception:
-                log.exception("could not write costs-summary.json")
-        if own_http:
-            http.close()
+        return "failed"
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -23,7 +23,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
 
-from agents_core import alerts, settings
+from agents_core import alerts, settings, tracing
 from agents_core.costs import CostTracker
 from agents_core.http import Http
 from agents_core.llm import LLM
@@ -48,6 +48,9 @@ class RunContext:
     # Collected by `warn()`; the runner publishes them (after AgentResult.warnings)
     # as `meta.warnings`.
     warnings: list[str] = field(default_factory=list)
+    # This run's tracer (published as trace.json). llm/http/agent_loop calls are traced
+    # automatically; use `tracing.span("custom", ...)` for your own steps.
+    tracer: tracing.Tracer = field(default_factory=tracing.Tracer)
 
     def warn(self, message: str) -> None:
         """Record a non-fatal problem ("ok with a warning"): logged now, and published

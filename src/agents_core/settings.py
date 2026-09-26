@@ -20,6 +20,7 @@ from typing import Any
 DEFAULT_DATA_DIR = Path("data")
 DEFAULT_PUBLISH_DIR = Path("public-data")
 DEFAULT_MAX_RUN_USD = 0.50
+DEFAULT_EVAL_MAX_USD = 1.00
 DEFAULT_MODELS_PATH = Path("config/models.toml")
 
 
@@ -58,6 +59,17 @@ def http_cache_dir() -> Path:
 
 def http_cache_ttl_seconds() -> int:
     return int(os.environ.get("AGENTS_CORE_HTTP_CACHE_TTL_SECONDS", 6 * 3600))
+
+
+def evals_dir() -> Path:
+    """Eval results and history (`results/<date>.json`, `history.jsonl`); committed by
+    the agent repo, so it lives outside data_dir()."""
+    return _path_from_env("AGENTS_CORE_EVALS_DIR", Path("evals"))
+
+
+def eval_max_usd() -> float:
+    value = os.environ.get("AGENTS_CORE_EVAL_MAX_USD")
+    return float(value) if value else DEFAULT_EVAL_MAX_USD
 
 
 def max_run_usd() -> float:

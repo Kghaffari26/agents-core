@@ -239,7 +239,7 @@ jobs:
     with:
       agent: real_estate
       max_run_usd: "0.50"
-      site_repo: Kghaffari26/agents-hub-site   # optional; omit to skip the dispatch
+      site_repo: Kghaffari26/agents-hub   # optional; omit to skip the dispatch
     secrets: inherit   # passes through ANTHROPIC_API_KEY, FRED_API_KEY, SAM_API_KEY,
                         # CENSUS_API_KEY, SITE_DISPATCH_TOKEN — any may be unset
 ```
@@ -252,6 +252,10 @@ commit — that branch's root is exactly the data-branch contract above. If
 `site_repo` and a `SITE_DISPATCH_TOKEN` secret are both set, it sends a
 `repository_dispatch` event (`agent-data-updated`) to that repo; otherwise it
 skips that step quietly.
+
+`ANTHROPIC_API_KEY` is read by `agents_core.llm`; if it's unset (some cloud
+dev environments reserve that name for their own use), it falls back to
+`AGENTS_ANTHROPIC_API_KEY`.
 
 ## Modules
 

@@ -68,6 +68,20 @@ def require_env(name: str) -> str:
     return value
 
 
+def anthropic_api_key() -> str:
+    """ANTHROPIC_API_KEY, falling back to AGENTS_ANTHROPIC_API_KEY.
+
+    Some cloud dev environments reserve the ANTHROPIC_API_KEY name for their own use,
+    so runs there can set AGENTS_ANTHROPIC_API_KEY instead.
+    """
+    value = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("AGENTS_ANTHROPIC_API_KEY")
+    if not value:
+        raise RuntimeError(
+            "Missing required environment variable ANTHROPIC_API_KEY (or AGENTS_ANTHROPIC_API_KEY)"
+        )
+    return value
+
+
 def load_dotenv(path: Path | None = None) -> None:
     """Load KEY=VALUE lines from `.env` without overriding variables already set."""
     path = path or Path(".env")

@@ -133,9 +133,24 @@ def test_batch_times_out_and_cancels():
 
 def test_missing_api_key_is_a_clear_error(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("AGENTS_ANTHROPIC_API_KEY", raising=False)
     llm = LLM(CostTracker(agent="a", run_id="r"))
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         llm.complete("fast", "p", system="s")
+
+
+def test_falls_back_to_agents_anthropic_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("AGENTS_ANTHROPIC_API_KEY", "sk-fallback")
+    llm = LLM(CostTracker(agent="a", run_id="r"))
+    assert llm.client.api_key == "sk-fallback"
+
+
+def test_prefers_anthropic_api_key_over_fallback(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-primary")
+    monkeypatch.setenv("AGENTS_ANTHROPIC_API_KEY", "sk-fallback")
+    llm = LLM(CostTracker(agent="a", run_id="r"))
+    assert llm.client.api_key == "sk-primary"
 
 
 # ---- number guard -------------------------------------------------------------

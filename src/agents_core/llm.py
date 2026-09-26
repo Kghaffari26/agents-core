@@ -120,8 +120,9 @@ class LLM:
     @property
     def client(self) -> Any:
         if self._client is None:
-            settings.require_env("ANTHROPIC_API_KEY")
-            self._client = anthropic.Anthropic(max_retries=_SDK_MAX_RETRIES)
+            self._client = anthropic.Anthropic(
+                api_key=settings.anthropic_api_key(), max_retries=_SDK_MAX_RETRIES
+            )
         return self._client
 
     # ---- request building -------------------------------------------------

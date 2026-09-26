@@ -13,7 +13,7 @@
 #       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.1.0
 #       with:
 #         agent: macro
-#         site_repo: Kghaffari26/agents-hub-site   # optional
+#         site_repo: Kghaffari26/agents-hub   # optional
 #       secrets: inherit
 #
 # `secrets: inherit` passes through whichever of ANTHROPIC_API_KEY, FRED_API_KEY,

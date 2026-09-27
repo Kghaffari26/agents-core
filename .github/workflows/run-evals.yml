@@ -14,10 +14,11 @@
 #     evals:
 #       permissions:
 #         contents: read
-#       uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.0
+#       uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.1
 #       with:
 #         eval_command: uv run agents-evals run fed_agent.evals:SUITE
-#         max_usd: "1.00"
+#         max_usd: "1.00"          # per suite
+#         total_max_usd: "2.00"    # optional: across all suites
 #         regression_threshold: "0.05"
 #       secrets: inherit
 #
@@ -43,6 +44,14 @@ on:
         required: false
         type: string
         default: "1.00"
+      total_max_usd:
+        description: >-
+          One spend cap in USD across every suite the command runs
+          (AGENTS_CORE_EVAL_TOTAL_MAX_USD, read by `agents-evals run`). Empty: no
+          total cap, only the per-suite max_usd.
+        required: false
+        type: string
+        default: ""
       regression_threshold:
         description: Fail when any score drops by more than this (0-1 scale)
         required: false
@@ -115,6 +124,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           AGENTS_CORE_EVAL_MAX_USD: ${{ inputs.max_usd }}
+          AGENTS_CORE_EVAL_TOTAL_MAX_USD: ${{ inputs.total_max_usd }}
           EVAL_COMMAND: ${{ inputs.eval_command }}
         run: bash -c "$EVAL_COMMAND"
 

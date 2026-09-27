@@ -11,8 +11,8 @@ Four repos depend on it: `real-estate-agent`, `fed-agent`, `sam-agent`, and
 `repo-maintain-agent` (all under `Kghaffari26`).
 
 > **Tag note:** the install line and the reusable workflows' `uses:` lines
-> below pin `@v0.3.0`. That tag needs to exist on this repo (`git tag
-> v0.3.0 && git push origin v0.3.0`, done by a human, not by an agent) before
+> below pin `@v0.3.1`. That tag needs to exist on this repo (`git tag
+> v0.3.1 && git push origin v0.3.1`, done by a human, not by an agent) before
 > they will resolve — until then, pin to `@v0.2.0` or a commit SHA. Upgrading?
 > See [Migrating from v0.2.0](#migrating-from-v020),
 > [Migrating from v0.1.0](#migrating-from-v010) and
@@ -69,13 +69,13 @@ read and act on. Every design choice follows from that:
 dependencies = ["agents-core"]
 
 [tool.uv.sources]
-agents-core = { git = "https://github.com/Kghaffari26/agents-core", tag = "v0.3.0" }
+agents-core = { git = "https://github.com/Kghaffari26/agents-core", tag = "v0.3.1" }
 ```
 
 or from the command line:
 
 ```bash
-uv add "agents-core @ git+https://github.com/Kghaffari26/agents-core@v0.3.0"
+uv add "agents-core @ git+https://github.com/Kghaffari26/agents-core@v0.3.1"
 ```
 
 ### Register your agent
@@ -209,9 +209,14 @@ result = ctx.llm.structured(
 ### Sampling and concurrency
 
 A tier can set `temperature` in `config/models.toml`, and every call
-(`complete`, `structured`, `batch`, `run_many`, `guard_batch`) takes a
-`temperature=` override. Neither is sent unless set — leave both unset for
-models that reject sampling parameters.
+(`complete`, `structured`, `converse`, `batch`, `run_many`, `guard_batch`, and
+`AgentLoop(temperature=)`) takes a `temperature=` override. Neither is sent
+unless set — leave both unset for models that reject sampling parameters
+(Sonnet 5 answers 400 "deprecated for this model"). Synchronous calls send it in
+the request body through the SDK's `extra_body` (the pinned anthropic SDK has no
+`temperature=` keyword), batch requests in each request's params; either way the
+API receives the same `"temperature"` field. A fake client in your tests sees
+`extra_body={"temperature": ...}`, not a `temperature` keyword.
 
 ```toml
 [tiers.fast]
@@ -546,7 +551,9 @@ uv run agents-evals compare --threshold 0.05     # exit 1 on a regression
   `forbidden_tools_not_called` (a queued approval counts as called),
   `max_steps`, `stop_reason` — these need the task to return a `LoopResult`
   (or `EvalOutput(output, loop=...)`); and `LLMJudge(rubric, tier="fast",
-  pass_threshold=0.75)`. Any `(case, out, ectx) -> Score` callable with a
+  pass_threshold=0.75, temperature=None, max_tokens=None)` (`None` uses the
+  tier's setting; a small `max_tokens` shrinks the judge's worst-case pre-call
+  estimate against the spend cap). Any `(case, out, ectx) -> Score` callable with a
   `name` works too.
 - **Judge calibration.** `judge.calibrate(llm, [LabeledExample(case, output,
   human_score), ...])` returns agreement, mean absolute error, bias and
@@ -557,6 +564,13 @@ uv run agents-evals compare --threshold 0.05     # exit 1 on a regression
   `AGENTS_CORE_EVAL_MAX_USD` (default $1.00) caps the whole suite, judge calls
   included. When the next call could pass it, that case and the rest are
   skipped and the report says `budget_exhausted`.
+- **Total spend cap.** `agents-evals run a:SUITE b:SUITE --total-max-usd 2.00`
+  (or `AGENTS_CORE_EVAL_TOTAL_MAX_USD`, or `run_suites(suites,
+  total_max_usd=)`) caps the whole run across suites: each suite gets the
+  smaller of its own cap and what the earlier suites left. A suite reached with
+  nothing left is still reported (every case skipped, `budget_exhausted`), and
+  `compare` doesn't count its empty pass rate as a regression. Unset, only the
+  per-suite cap applies.
 - **Output.** `run_suite` writes `evals/results/<YYYY-MM-DD>.json` (that day's
   latest report per suite, every case's scores) and appends one line per suite
   to `evals/history.jsonl`: `ts`, `suite`, `prompt_version`, `git_sha`,
@@ -642,7 +656,7 @@ jobs:
   run:
     permissions:
       contents: write   # required
-    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.0
+    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
     with:
       agent: real_estate
       max_run_usd: "0.50"
@@ -684,13 +698,13 @@ jobs:
   report:
     if: vars.APPLY_CHANGES != 'true'
     permissions: { contents: write, issues: read, pull-requests: read }
-    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.0
+    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
     with: { agent: repo_maint }
     secrets: inherit
   apply:
     if: vars.APPLY_CHANGES == 'true'
     permissions: { contents: write, issues: write, pull-requests: read }
-    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.0
+    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
     with: { agent: repo_maint, apply_changes: true, extra_args: --apply }
     secrets: inherit
 ```
@@ -715,10 +729,11 @@ jobs:
   evals:
     permissions:
       contents: read
-    uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.0
+    uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.1
     with:
       eval_command: uv run agents-evals run fed_agent.evals:SUITE
       max_usd: "1.00"               # AGENTS_CORE_EVAL_MAX_USD
+      total_max_usd: "2.00"         # optional; AGENTS_CORE_EVAL_TOTAL_MAX_USD
       regression_threshold: "0.05"  # fail if any score drops by more than this
     secrets: inherit
 ```
@@ -732,7 +747,9 @@ then `agents-evals compare`, which writes a markdown table of score deltas to
 the job summary and fails the job on a regression beyond
 `regression_threshold`. Like `run-agent.yml` it declares no permissions of its
 own; it needs only `contents: read`. The only secret it reads is
-`ANTHROPIC_API_KEY` (optional).
+`ANTHROPIC_API_KEY` (optional). `max_usd` caps each suite; `total_max_usd`
+(default empty: none) caps everything `eval_command` runs through
+`agents-evals run`.
 ## A complete example agent
 
 Everything above in one agent: numbers computed in `transform`, a budgeted,
@@ -901,6 +918,21 @@ loop](#the-agent-loop), and call `run-agent.yml` on a schedule and
 | `agents_core.settings` | `data_dir()`/`publish_dir()`/`evals_dir()` and every other configurable path; `config/models.toml` loading. |
 
 None of these assume a particular website's layout or a fixed set of agents.
+
+## Migrating from v0.3.0
+
+v0.3.1 is a bug-fix release; every v0.3.0 call still works, and `latest.json`,
+`meta` and the data-branch files are unchanged.
+
+1. **Bump the pin** to `v0.3.1` in `pyproject.toml` and `uv lock`, and in your
+   workflows' `uses: ...run-agent.yml@v0.3.1` / `run-evals.yml@v0.3.1`.
+2. **`temperature` works on synchronous calls now.** Drop any local shim that
+   moved it into `extra_body` (sam-agent's `llm_compat.py`, a judge subclass),
+   or keep it — it's a no-op once the parameter already arrives in
+   `extra_body`. Tests whose fake client asserted `kwargs["temperature"]` should
+   read `kwargs["extra_body"]["temperature"]`.
+3. **Optional:** replace a per-repo "pass each suite what's left" wrapper with
+   `agents-evals run ... --total-max-usd` or the workflow's `total_max_usd`.
 
 ## Migrating from v0.2.0
 

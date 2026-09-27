@@ -72,6 +72,13 @@ def eval_max_usd() -> float:
     return float(value) if value else DEFAULT_EVAL_MAX_USD
 
 
+def eval_total_max_usd() -> float | None:
+    """`$AGENTS_CORE_EVAL_TOTAL_MAX_USD`: one cap across every suite of an
+    `agents-evals run` (None when unset: only the per-suite cap applies)."""
+    value = os.environ.get("AGENTS_CORE_EVAL_TOTAL_MAX_USD")
+    return float(value) if value else None
+
+
 def max_run_usd() -> float:
     value = os.environ.get("AGENTS_CORE_MAX_RUN_USD")
     return float(value) if value else DEFAULT_MAX_RUN_USD

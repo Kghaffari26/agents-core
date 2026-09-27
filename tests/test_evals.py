@@ -281,6 +281,65 @@ def test_eval_max_usd_env_default(isolated_paths, monkeypatch):
     assert run_suite(simple_suite([0]), write=False).max_usd == 0.25
 
 
+def llm_suite(name, n):
+    def task(case, ectx):
+        return ectx.llm.complete("smart", "p", system="s", max_tokens=100)
+
+    return EvalSuite(
+        name=name,
+        cases=[EvalCase(id=f"{name}{i}", expected="hello") for i in range(n)],
+        task=task,
+        scorers=[exact()],
+    )
+
+
+def test_total_cap_spans_suites(isolated_paths):
+    # each call costs $0.004 (worst case ~$0.001 up front); $0.0125 fits three calls
+    client = FakeClient([fake_message("hello") for _ in range(6)])
+    suites = [llm_suite("a", 2), llm_suite("b", 2), llm_suite("c", 2)]
+    reports = evals.run_suites(suites, total_max_usd=0.0125, llm_client=client, write=False)
+    assert [r.suite for r in reports] == ["a", "b", "c"]
+    assert [r.n_scored for r in reports] == [2, 1, 0]
+    assert [r.budget_exhausted for r in reports] == [False, True, True]
+    assert reports[0].max_usd == 0.0125
+    assert reports[1].max_usd == pytest.approx(0.0045)
+    assert len(client.messages.calls) == 3
+    assert sum(r.usd for r in reports) <= 0.0125
+
+
+def test_total_cap_never_raises_a_suite_cap(isolated_paths, monkeypatch):
+    monkeypatch.setenv("AGENTS_CORE_EVAL_TOTAL_MAX_USD", "5")
+    reports = evals.run_suites([simple_suite([0], max_usd=0.3), simple_suite([0])], write=False)
+    assert [r.max_usd for r in reports] == [0.3, 1.0]
+    monkeypatch.delenv("AGENTS_CORE_EVAL_TOTAL_MAX_USD")
+    reports = evals.run_suites([simple_suite([0])], max_usd=2.0, write=False)
+    assert reports[0].max_usd == 2.0  # no total cap by default
+
+
+def test_run_cli_total_max_usd(isolated_paths, monkeypatch, capsys):
+    client = FakeClient([fake_message("hello") for _ in range(4)])
+    monkeypatch.setattr(
+        evals, "LLM", lambda tracker, client=None, _c=client: LLM(tracker, client=_c)
+    )
+    monkeypatch.setitem(
+        sys.modules, "cap_evals", SimpleNamespace(A=llm_suite("a", 2), B=llm_suite("b", 2))
+    )
+    argv = ["run", "cap_evals:A", "cap_evals:B", "--total-max-usd", "0.0085"]
+    assert evals.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "a: pass_rate=1.000" in out and "b: pass_rate=0.000" in out
+    assert "(spend cap reached)" in out.splitlines()[1]
+    assert len(client.messages.calls) == 2
+
+
+def test_llm_judge_temperature_and_max_tokens():
+    llm = judge_llm([4])
+    c = EvalContext(llm=llm, costs=llm.tracker, case=CASE)
+    LLMJudge("ok?", temperature=0, max_tokens=300)(CASE, EvalOutput("x"), c)
+    call = llm.client.messages.calls[0]
+    assert call["extra_body"] == {"temperature": 0} and call["max_tokens"] == 300
+
+
 # ---- compare --------------------------------------------------------------------------
 
 
@@ -333,6 +392,15 @@ def test_compare_first_run_has_no_baseline(tmp_path):
     assert c.previous is None and c.regressions == []
     assert "No previous entry" in evals.comparisons_markdown([c])
     assert evals.compare(tmp_path / "missing.jsonl") == []
+
+
+def test_compare_ignores_pass_rate_of_a_suite_that_never_ran(tmp_path):
+    history = tmp_path / "history.jsonl"
+    starved = {**entry("a", "s2", 0.0), "n_scored": 0, "budget_exhausted": True}
+    write_history(history, entry("a", "s1", 1.0, exact=1.0), starved)
+    (c,) = evals.compare(history)
+    assert c.regressions == []
+    assert "Spend cap reached: only 0/4" in evals.comparisons_markdown([c])
 
 
 def test_compare_cli_exit_code_and_markdown_summary(tmp_path, capsys):

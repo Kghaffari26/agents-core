@@ -4,6 +4,42 @@ All notable changes to agents-core. Versions are git tags on this repo
 (`@vX.Y.Z`); agent repos pin one. See the README's "Migrating from ..." sections
 for upgrade steps.
 
+## v0.3.1 — 2026-09-27
+
+A patch release fixing what the four agent repos reported against v0.3.0.
+Backwards compatible; `latest.json`, `meta` and the data-branch files are unchanged.
+See the README's "Migrating from v0.3.0".
+
+### Fixed
+
+- **`temperature` broke synchronous calls.** A tier's (models.toml) or a per-call
+  `temperature` was passed as a keyword to `client.messages.create`/`parse`, which
+  the pinned anthropic SDK (1.8) doesn't accept: `TypeError` on every `complete`,
+  `structured`, `converse`/`AgentLoop`, `run_many` and guard-retry call on such a
+  tier (seen live with the eval judge on the fast tier). It now goes in the request
+  body through `extra_body`, so the API receives the same `"temperature"` field.
+  Batch requests were unaffected (their params are JSON) and are unchanged. New
+  tests drive the real SDK against a local stub HTTP server for structured,
+  complete, converse and batch calls.
+- **`agents-evals compare` reported a pass-rate regression for a suite where no
+  case ran** (spend cap reached before the first case): an entry with
+  `n_scored == 0` now has no pass rate to compare.
+
+### Added
+
+- **One total eval spend cap across suites:** `agents-evals run ...
+  --total-max-usd`, `$AGENTS_CORE_EVAL_TOTAL_MAX_USD`, `evals.run_suites(suites,
+  total_max_usd=)`, and `run-evals.yml`'s `total_max_usd` input (default empty: no
+  total cap). Each suite gets the smaller of its own cap and what's left.
+- `LLMJudge(temperature=, max_tokens=)` (default `None`: the tier's settings).
+
+### Deferred (reported, not in this patch)
+
+- `LLMJudge` `input=` selector for rendering a case's input (fed-agent).
+- Response headers on `Http.download`'s `DownloadResult` (repo-maintain-agent).
+- An optional "no multiples/ratios" number-guard check (real-estate-agent).
+- Marking eval history entries run on an uncommitted tree (sam-agent).
+
 ## v0.3.0 — 2026-09-26
 
 The agentic building blocks: a budgeted tool-use loop, run tracing, and an eval

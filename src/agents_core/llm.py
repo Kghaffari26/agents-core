@@ -11,11 +11,13 @@ failing output is retried once with the unsupported numbers named, then replaced
 `fallback()`. Guarded calls return `Guarded(value, narrative_source, ...)`.
 
 Sampling: a tier may set `temperature` in models.toml, and every call takes a
-`temperature=` override. Leave both unset for models that reject sampling
-parameters. Synchronous calls made together (`run_many`, `guard_batch` retries, a
-batch's `on_timeout="sync"` fallback) run on up to `max_concurrency` threads
-(`[llm] max_concurrency` in models.toml, the `LLM(max_concurrency=)` argument, or a
-per-call override); the default of 1 keeps them sequential.
+`temperature=` override; it works for every call type (synchronous calls send it
+in the request body via `extra_body`, batches in each request's params). Leave both
+unset for models that reject sampling parameters. Synchronous calls made together
+(`run_many`, `guard_batch` retries, a batch's `on_timeout="sync"` fallback) run on
+up to `max_concurrency` threads (`[llm] max_concurrency` in models.toml, the
+`LLM(max_concurrency=)` argument, or a per-call override); the default of 1 keeps
+them sequential.
 
 Multi-turn tool use: `converse()` sends one request of a conversation you manage
 (messages + tool definitions) and returns a `Turn` with plain-dict content blocks;
@@ -56,6 +58,24 @@ X = TypeVar("X")
 # Rough chars-per-token used only for the pre-call budget estimate.
 _CHARS_PER_TOKEN = 3.5
 _SDK_MAX_RETRIES = 4
+
+
+# Request parameters the installed SDK's `messages.create`/`messages.parse` don't take
+# as keyword arguments (anthropic 1.8 has no `temperature=`: passing it raised
+# TypeError before v0.3.1). They're sent in `extra_body`, which the SDK merges into
+# the JSON request body unchanged, so the API sees the same request either way.
+# Batch requests are plain JSON already and carry them as-is.
+_BODY_ONLY_PARAMS = ("temperature",)
+
+
+def _sdk_kwargs(params: dict[str, Any]) -> dict[str, Any]:
+    """`params` as keyword arguments for `client.messages.create`/`parse`."""
+    moved = {k: params[k] for k in _BODY_ONLY_PARAMS if k in params}
+    if not moved:
+        return params
+    kwargs = {k: v for k, v in params.items() if k not in moved}
+    kwargs["extra_body"] = {**(params.get("extra_body") or {}), **moved}
+    return kwargs
 
 
 class LLMError(RuntimeError):
@@ -305,9 +325,11 @@ class LLM:
             sp.set(estimated_usd=round(estimate, 6))
             with self.tracker.reserve(estimate):
                 if output_model is None:
-                    message = self.client.messages.create(**params)
+                    message = self.client.messages.create(**_sdk_kwargs(params))
                 else:
-                    message = self.client.messages.parse(output_format=output_model, **params)
+                    message = self.client.messages.parse(
+                        output_format=output_model, **_sdk_kwargs(params)
+                    )
                 usage = Usage.from_api(message.usage)
                 sp.set(
                     **_usage_attrs(usage),
@@ -373,7 +395,7 @@ class LLM:
             if budget is not None:
                 budget.check(estimate)
             with self.tracker.reserve(estimate):
-                message = self.client.messages.create(**params)
+                message = self.client.messages.create(**_sdk_kwargs(params))
                 usage = Usage.from_api(message.usage)
                 usd = usd_for(cfg.model, usage)
                 sp.set(**_usage_attrs(usage), usd=round(usd, 6), stop_reason=message.stop_reason)

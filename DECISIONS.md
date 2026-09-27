@@ -71,3 +71,17 @@ One line per judgment call, newest release first.
 - Added `pyyaml` as a dev dependency so the workflow test can parse run-agent.yml and execute its restore/publish scripts against a local bare git remote.
 - Left `http.USER_AGENT` unchanged to avoid perturbing any upstream allow-listing.
 - Pushed to `main` as instructed (also mirrored to the session branch); no tag created — a human tags v0.2.0.
+
+## v0.3.1
+
+- `temperature` always goes to `messages.create`/`parse` via `extra_body` (not detected per SDK version): anthropic 1.8 (uv.lock) has no `temperature=` on either, `extra_body` works on any version, and the API sees the same JSON field; batches keep it in `params` because they're plain JSON (verified against the real SDK).
+- Only `temperature` is moved (`_BODY_ONLY_PARAMS`); the internal `params` dict keeps it top-level so cost estimates, guard-retry params, prompt hashes and batch requests are unchanged.
+- The SDK test uses a real local `http.server` stub, not respx/httpx.MockTransport: the SDK now uses `httpx2` and rejects `httpx` clients, and respx isn't a dependency; the SDK client is built via `agents_core.llm.anthropic` so no other module imports `anthropic`.
+- Total eval cap is additive: `run_suites` + `--total-max-usd` + `AGENTS_CORE_EVAL_TOTAL_MAX_USD` + a `total_max_usd` workflow input defaulting to empty (no total cap), so existing callers behave exactly as before; a total never raises a suite's own cap.
+- A suite reached with no budget left still runs `run_suite` with a $0 cap (all cases skipped) so history records that it didn't run, rather than silently omitting it.
+- `compare` treats an entry with `n_scored == 0` as having no pass rate; otherwise a budget-starved suite (now more likely with a total cap) would fail the PR gate with a fake pass-rate regression. Budget-partial suites still compare as before.
+- `agents-evals run` now loads every suite before running any, so a typo in the last target fails before money is spent.
+- Added `LLMJudge(temperature=, max_tokens=)` in this patch (small, additive, directly tied to the temperature bug and to repo-maintain's inflated judge estimate); deferred the judge `input=` selector, `DownloadResult` headers, a multiples/ratios guard and dirty-tree eval attribution as features/design work beyond a patch — listed in the CHANGELOG.
+- Dirty-tree attribution deferred specifically because the eval run itself writes tracked files (`evals/results/*.json`, `history.jsonl`), so a naive dirty check would split one run's suites across two "SHAs" and break `compare`'s same-SHA grouping.
+- Doc pins moved to `@v0.3.1` (README install lines and workflow examples, run-agent.yml/run-evals.yml headers, CLAUDE.md); historical "Migrating from" sections keep their versions.
+- Pushed to `main` as instructed (and to the session branch); no tag created — a human tags v0.3.1.

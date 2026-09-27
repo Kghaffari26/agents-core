@@ -79,6 +79,7 @@ def test_no_temperature_sent_by_default():
     llm, _ = make_llm(client)
     llm.complete("smart", "p", system="s")
     assert "temperature" not in client.messages.calls[0]
+    assert "extra_body" not in client.messages.calls[0]
     assert tier_config("smart").temperature is None
 
 
@@ -89,7 +90,7 @@ def test_tier_temperature_from_models_toml(models_toml):
     llm, _ = make_llm(client)
     llm.complete("fast", "p", system="s")
     llm.complete("smart", "p", system="s")
-    assert [c["temperature"] for c in client.messages.calls] == [0.0, 0.3]
+    assert [c["extra_body"]["temperature"] for c in client.messages.calls] == [0.0, 0.3]
     # The shipped defaults are still merged underneath.
     assert client.messages.calls[0]["model"] == "claude-haiku-4-5-20251001"
 
@@ -99,7 +100,7 @@ def test_per_call_temperature_overrides_tier(models_toml):
     client = FakeClient([fake_message("x", parsed=Brief(summary="x"))])
     llm, _ = make_llm(client)
     llm.structured("fast", "p", Brief, system="s", temperature=0)
-    assert client.messages.calls[0]["temperature"] == 0
+    assert client.messages.calls[0]["extra_body"]["temperature"] == 0
 
 
 def test_guard_retry_keeps_temperature():
@@ -109,7 +110,7 @@ def test_guard_retry_keeps_temperature():
 
     out = llm.complete("fast", "p", system="s", temperature=0.1, guard=text_guard({"n": 5}))
     assert out.value == "5 bids"
-    assert [c["temperature"] for c in client.messages.calls] == [0.1, 0.1]
+    assert [c["extra_body"]["temperature"] for c in client.messages.calls] == [0.1, 0.1]
 
 
 def test_batch_requests_carry_temperature():
@@ -222,7 +223,7 @@ def test_batch_timeout_sync_fallback_runs_concurrently():
     assert 1 < client.peak <= 5
     assert all(r.via == "sync" for r in results.values())
     assert results["5"].value == Brief(summary="re:p5")
-    assert all(c["temperature"] == 0 for c in client.calls)
+    assert all(c["extra_body"]["temperature"] == 0 for c in client.calls)
     assert tracker.calls == 6
 
 

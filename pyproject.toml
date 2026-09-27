@@ -1,6 +1,6 @@
 [project]
 name = "agents-core"
-version = "0.3.0"
+version = "0.3.1"
 description = "Shared framework for scheduled data agents: HTTP caching, cost tracking, a number guard, tiered/cached Claude calls, a budgeted tool-use loop, tracing, evals, publish + entry-point agent registration."
 requires-python = ">=3.12,<3.13"
 dependencies = [

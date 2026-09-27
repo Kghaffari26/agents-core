@@ -21,8 +21,11 @@ you can compare against.
 A task gets an `EvalContext` whose `llm` bills a tracker capped at the suite's
 `max_usd` (`--max-usd`, `$AGENTS_CORE_EVAL_MAX_USD`, default $1.00): once the cap would
 be passed, the current and remaining cases are skipped and the report says
-`budget_exhausted`. Return an `AgentLoop`'s `LoopResult` (or an `EvalOutput(output,
-loop=...)`) to make the trajectory scorers work.
+`budget_exhausted`. `run_suites` (and `agents-evals run a:S b:S --total-max-usd`,
+`$AGENTS_CORE_EVAL_TOTAL_MAX_USD`) also caps the run's total across suites: each
+suite gets the smaller of its own cap and what the earlier suites left. Return an
+`AgentLoop`'s `LoopResult` (or an `EvalOutput(output, loop=...)`) to make the
+trajectory scorers work.
 
 `run_suite` writes `evals/results/<YYYY-MM-DD>.json` (that day's latest report per
 suite) and appends one line to `evals/history.jsonl` with the suite, prompt_version,
@@ -367,8 +370,12 @@ class LLMJudge(Scorer):
         expected: str | Callable[[Any], Any] | None = None,
         adjust: Callable[[float], float] | None = None,
         name: str = "llm_judge",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         self.rubric = rubric
+        self.temperature = temperature  # None: the tier's (models.toml)
+        self.max_tokens = max_tokens  # None: the tier's; lower it to shrink the pre-call estimate
         self.tier = tier
         self.pass_threshold = pass_threshold
         self.output = output
@@ -395,7 +402,9 @@ class LLMJudge(Scorer):
             self._prompt(case, output),
             JudgeVerdict,
             system=JUDGE_SYSTEM,
+            max_tokens=self.max_tokens,
             purpose=f"judge:{self.name}:{case.id}",
+            temperature=self.temperature,
         )
         value = (verdict.score - 1) / 4
         if self.adjust is not None:
@@ -579,6 +588,40 @@ def run_suite(
     return report
 
 
+def run_suites(
+    suites: Sequence[EvalSuite],
+    *,
+    max_usd: float | None = None,
+    total_max_usd: float | None = None,
+    llm_client: Any = None,
+    write: bool = True,
+    evals_dir: Path | str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> list[EvalReport]:
+    """Run suites in order under one total spend cap.
+
+    `total_max_usd` (default `$AGENTS_CORE_EVAL_TOTAL_MAX_USD`; None = no total cap)
+    bounds the run's spend across all suites: each suite's cap is the smaller of its
+    own (`max_usd`, else `suite.max_usd`, else `$AGENTS_CORE_EVAL_MAX_USD`) and what
+    the earlier suites left. A suite reached with nothing left still gets a report
+    (every case skipped, `budget_exhausted`), so the history shows it didn't run.
+    """
+    total = settings.eval_total_max_usd() if total_max_usd is None else total_max_usd
+    spent = 0.0
+    reports = []
+    for suite in suites:
+        cap = max_usd if max_usd is not None else suite.max_usd
+        cap = settings.eval_max_usd() if cap is None else cap
+        if total is not None:
+            cap = max(min(cap, total - spent), 0.0)
+        report = run_suite(
+            suite, max_usd=cap, llm_client=llm_client, write=write, evals_dir=evals_dir, now=now
+        )
+        spent += report.usd
+        reports.append(report)
+    return reports
+
+
 def _run_case(suite: EvalSuite, case: EvalCase, llm: LLM, tracker: CostTracker) -> CaseResult:
     before = tracker.total_usd
     ctx = EvalContext(llm=llm, costs=tracker, case=case)
@@ -678,12 +721,17 @@ def read_history(path: Path | str | None = None) -> list[dict[str, Any]]:
 def compare_entries(
     current: dict[str, Any], previous: dict[str, Any] | None, *, threshold: float
 ) -> Comparison:
-    cur = {**current.get("scores", {}), "pass_rate": current.get("pass_rate", 0.0)}
-    prev = (
-        {**previous.get("scores", {}), "pass_rate": previous.get("pass_rate", 0.0)}
-        if previous
-        else {}
-    )
+    def values(entry: dict[str, Any]) -> dict[str, float | None]:
+        # An entry where no case ran (spend cap reached first) has no pass rate: its
+        # 0.0 would otherwise be reported as a regression.
+        scored = entry.get("n_scored") != 0
+        return {
+            **entry.get("scores", {}),
+            "pass_rate": entry.get("pass_rate", 0.0) if scored else None,
+        }
+
+    cur = values(current)
+    prev = values(previous) if previous else {}
     deltas = []
     for name in [*cur, *(n for n in prev if n not in cur)]:
         c, p = cur.get(name), prev.get(name)
@@ -802,7 +850,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     run_p = sub.add_parser("run", help="run an EvalSuite (module:attribute)")
     run_p.add_argument("suite", nargs="+", help="e.g. fed_agent.evals:SUITE")
-    run_p.add_argument("--max-usd", type=float, default=None)
+    run_p.add_argument("--max-usd", type=float, default=None, help="cap per suite")
+    run_p.add_argument(
+        "--total-max-usd",
+        type=float,
+        default=None,
+        help="cap across all suites (default: $AGENTS_CORE_EVAL_TOTAL_MAX_USD, else none)",
+    )
     run_p.add_argument("--no-write", action="store_true", help="don't write results/history")
     cmp_p = sub.add_parser("compare", help="compare the latest history entry with the previous")
     cmp_p.add_argument("--history", default=None, help="default: evals/history.jsonl")
@@ -814,8 +868,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         settings.load_dotenv()
-        for target in args.suite:
-            report = run_suite(_load_suite(target), max_usd=args.max_usd, write=not args.no_write)
+        reports = run_suites(
+            [_load_suite(target) for target in args.suite],
+            max_usd=args.max_usd,
+            total_max_usd=args.total_max_usd,
+            write=not args.no_write,
+        )
+        for report in reports:
             print(
                 f"{report.suite}: pass_rate={report.pass_rate:.3f} "
                 + " ".join(f"{k}={v:.3f}" for k, v in report.scores.items())

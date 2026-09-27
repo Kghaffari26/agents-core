@@ -37,6 +37,7 @@ def test_inputs(wf):
     inputs = triggers(wf)["workflow_call"]["inputs"]
     assert inputs["eval_command"]["required"] is True
     assert inputs["max_usd"]["default"] == "1.00"
+    assert inputs["total_max_usd"]["default"] == ""
     assert inputs["regression_threshold"]["default"] == "0.05"
     assert triggers(wf)["workflow_call"]["secrets"]["ANTHROPIC_API_KEY"] == {"required": False}
 
@@ -49,6 +50,7 @@ def test_inputs_are_not_interpolated_into_scripts(wf):
 def test_eval_and_compare_steps(wf):
     run = steps(wf)["Run evals"]
     assert run["env"]["AGENTS_CORE_EVAL_MAX_USD"] == "${{ inputs.max_usd }}"
+    assert run["env"]["AGENTS_CORE_EVAL_TOTAL_MAX_USD"] == "${{ inputs.total_max_usd }}"
     assert run["env"]["EVAL_COMMAND"] == "${{ inputs.eval_command }}"
     compare = steps(wf)["Compare with previous results"]["run"]
     assert "agents-evals compare" in compare and '--markdown "$GITHUB_STEP_SUMMARY"' in compare

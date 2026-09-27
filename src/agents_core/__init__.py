@@ -7,4 +7,4 @@ with dated history, and agent registration via the `agents_core.agents` entry-po
 group. See the README for the full data-branch contract.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

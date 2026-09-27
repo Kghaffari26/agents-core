@@ -115,8 +115,8 @@ uv run ruff format --check .               # format check
 
 ## Releasing
 
-Agent repos and the reusable workflows' doc examples pin a tag (currently `@v0.3.0`).
+Agent repos and the reusable workflows' doc examples pin a tag (currently `@v0.3.1`).
 Bump `pyproject.toml`'s `version` and `agents_core.__version__`, run `uv lock`, add a
 `CHANGELOG.md` section, update the README's pins, then a human (not an agent session)
-tags and pushes: `git tag v0.3.0 && git push origin v0.3.0` — agent sessions in this
+tags and pushes: `git tag v0.3.1 && git push origin v0.3.1` — agent sessions in this
 repo should never push a tag themselves.

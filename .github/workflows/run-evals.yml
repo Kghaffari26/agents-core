@@ -14,7 +14,7 @@
 #     evals:
 #       permissions:
 #         contents: read
-#       uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.1
+#       uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.2
 #       with:
 #         eval_command: uv run agents-evals run fed_agent.evals:SUITE
 #         max_usd: "1.00"          # per suite

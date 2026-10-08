@@ -4,6 +4,39 @@ All notable changes to agents-core. Versions are git tags on this repo
 (`@vX.Y.Z`); agent repos pin one. See the README's "Migrating from ..." sections
 for upgrade steps.
 
+## v0.3.2 — 2026-10-08
+
+The four items deferred from v0.3.1, one per agent repo. Additive; `latest.json`,
+`meta` and the data-branch files are unchanged. See the README's "Migrating from
+v0.3.1".
+
+### Added
+
+- **Number guard: opt-in "no multiples/ratios" check** (real-estate-agent).
+  `verify_numbers`/`text_guard`/`fields_guard(..., no_multiples=True)` also reject
+  multiples and ratios the model computed ("4.3 times", "3x", "2-fold", "three
+  times", "twice", "doubled", "half as", "3:1", "3-to-1", "a ratio of 2.5"), which
+  pass the value check whenever the number happens to be another fact. They're in
+  `GuardResult.unsupported` and the new `GuardResult.derived`; `guards.find_derived`
+  finds them. The guard retry (in `LLM` and `AgentLoop`) now uses
+  `guards.retry_instruction(result)`, which adds "state both figures instead" for
+  derived phrases and is unchanged otherwise. `RETRY_INSTRUCTION` moved to
+  `agents_core.guards` and is still importable from `agents_core.llm`.
+- **`DownloadResult.headers` and `.links`** (repo-maintain-agent): the response's
+  headers (lower-cased, `set-cookie` dropped), on a 304 too, and `Link` parsed into
+  `{rel: url}`. New `http.parse_link_header`.
+- **`LLMJudge(input=)`** (fed-agent): a dotted path or callable narrowing the task
+  input the judge sees, like `output=`. A task can also return
+  `EvalOutput(..., input=...)` with what it actually gave the model when that
+  differs from `case.input`; the judge shows that instead. `LabeledExample.input`
+  does the same for `calibrate()`.
+- **Evals run on uncommitted changes are marked** (sam-agent): `EvalReport.dirty`
+  and a `dirty` key in `history.jsonl` (`null` without git), checked once before
+  the first case runs, counting changes to tracked files outside the evals dir and
+  `data_dir()` (which the run writes). `compare`'s markdown warns about dirty
+  entries; grouping by `git_sha` is unchanged. `evals.git_dirty()`,
+  `run_suite(dirty=)`, `$AGENTS_CORE_GIT_DIRTY` override.
+
 ## v0.3.1 — 2026-09-27
 
 A patch release fixing what the four agent repos reported against v0.3.0.

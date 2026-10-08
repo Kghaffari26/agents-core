@@ -94,6 +94,9 @@ def load_cases(path: Path | str) -> list[EvalCase]:
 class EvalOutput:
     output: Any
     loop: LoopResult[Any] | None = None
+    # What the task actually gave the model, when that differs from `case.input`
+    # (e.g. facts rebuilt from a fixture). `LLMJudge` shows this instead of `case.input`.
+    input: Any = None
 
 
 @dataclass
@@ -316,11 +319,13 @@ JUDGE_SYSTEM = (
 
 
 class LabeledExample(BaseModel):
-    """An output a human scored (0..1), for `LLMJudge.calibrate`."""
+    """An output a human scored (0..1), for `LLMJudge.calibrate`. `input`, when set,
+    is what the model saw (as `EvalOutput.input`); else the judge shows `case.input`."""
 
     case: EvalCase
     output: Any
     human_score: float = Field(ge=0, le=1)
+    input: Any = None
 
 
 class CalibrationReport(BaseModel):
@@ -355,7 +360,10 @@ class LLMJudge(Scorer):
     """Scores an output against a rubric with a (cheap, by default) model.
 
     The 1-5 verdict is normalized to 0..1 ((score - 1) / 4), then passed through
-    `adjust` (the calibration hook). Check the judge against human labels with
+    `adjust` (the calibration hook). The prompt shows the task input — `EvalOutput.input`
+    if the task set it, else `case.input` — narrowed by `input=`, the output narrowed by
+    `output=`, and the reference (`case.expected`) narrowed by `expected=`; each is a
+    dotted path or a callable. Check the judge against human labels with
     `calibrate(llm, examples)` before trusting it; `report.offset_adjust()` corrects
     a constant bias.
     """
@@ -370,6 +378,7 @@ class LLMJudge(Scorer):
         expected: str | Callable[[Any], Any] | None = None,
         adjust: Callable[[float], float] | None = None,
         name: str = "llm_judge",
+        input: str | Callable[[Any], Any] | None = None,  # noqa: A002 - mirrors output=
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> None:
@@ -380,26 +389,31 @@ class LLMJudge(Scorer):
         self.pass_threshold = pass_threshold
         self.output = output
         self.expected = expected
+        self.input = input
         self.adjust = adjust
         self.name = name
 
-    def _prompt(self, case: EvalCase, output: Any) -> str:
+    def _prompt(self, case: EvalCase, output: Any, task_input: Any = None) -> str:
         def render(v: Any) -> str:
             if isinstance(v, BaseModel):
                 return v.model_dump_json(indent=2)
             return v if isinstance(v, str) else json.dumps(v, default=str, indent=2)
 
-        parts = [f"Rubric:\n{self.rubric}", f"<input>\n{render(case.input)}\n</input>"]
+        shown = _pick(case.input if task_input is None else task_input, self.input)
+        parts = [f"Rubric:\n{self.rubric}", f"<input>\n{render(shown)}\n</input>"]
         reference = _pick(case.expected, self.expected)
         if reference is not None:
             parts.append(f"<reference>\n{render(reference)}\n</reference>")
         parts.append(f"<output>\n{render(output)}\n</output>")
         return "\n\n".join(parts)
 
-    def judge(self, llm: LLM, case: EvalCase, output: Any) -> tuple[float, str]:
+    def judge(
+        self, llm: LLM, case: EvalCase, output: Any, task_input: Any = None
+    ) -> tuple[float, str]:
+        """Score `output`. `task_input` replaces `case.input` in the prompt when given."""
         verdict = llm.structured(
             self.tier,
-            self._prompt(case, output),
+            self._prompt(case, output, task_input),
             JudgeVerdict,
             system=JUDGE_SYSTEM,
             max_tokens=self.max_tokens,
@@ -412,11 +426,13 @@ class LLMJudge(Scorer):
         return value, verdict.reasoning
 
     def score(self, case: EvalCase, out: EvalOutput, ctx: EvalContext) -> Score:
-        value, reasoning = self.judge(ctx.llm, case, _pick(out.output, self.output))
+        value, reasoning = self.judge(ctx.llm, case, _pick(out.output, self.output), out.input)
         return self._result(value, value >= self.pass_threshold, reasoning)
 
     def calibrate(self, llm: LLM, examples: Sequence[LabeledExample]) -> CalibrationReport:
-        pairs = [(self.judge(llm, ex.case, ex.output)[0], ex.human_score) for ex in examples]
+        pairs = [
+            (self.judge(llm, ex.case, ex.output, ex.input)[0], ex.human_score) for ex in examples
+        ]
         n = len(pairs)
         if not n:
             return CalibrationReport(n=0, agreement=0.0, mean_abs_error=0.0, bias=0.0)
@@ -471,6 +487,9 @@ class EvalReport(BaseModel):
     pass_rate: float
     scores: dict[str, float]
     cases: list[CaseResult]
+    # True: run with uncommitted changes to tracked files (outside the evals and data
+    # dirs), so `git_sha` is the commit those changes sit on. None: unknown (no git).
+    dirty: bool | None = None
 
     def history_entry(self) -> dict[str, Any]:
         return {
@@ -485,6 +504,7 @@ class EvalReport(BaseModel):
             "n_cases": self.n_cases,
             "n_scored": self.n_scored,
             "budget_exhausted": self.budget_exhausted,
+            "dirty": self.dirty,
         }
 
 
@@ -499,6 +519,43 @@ def git_sha() -> str:
         return out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return os.environ.get("GITHUB_SHA", "unknown")
+
+
+def _git(*args: str) -> str:
+    out = subprocess.run(["git", *args], capture_output=True, text=True, check=True, timeout=10)
+    return out.stdout
+
+
+def git_dirty(exclude: Sequence[Path | str] = ()) -> bool | None:
+    """Whether tracked files have uncommitted changes (staged or not), ignoring paths
+    under `exclude` (CWD-relative). `$AGENTS_CORE_GIT_DIRTY` ("true"/"false") overrides.
+    None when git isn't available or this isn't a work tree. Untracked files don't count.
+    """
+    override = os.environ.get("AGENTS_CORE_GIT_DIRTY", "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    try:
+        top = Path(_git("rev-parse", "--show-toplevel").strip()).resolve()
+        status = _git("status", "--porcelain=v1", "-z", "--untracked-files=no")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    skip = [Path(e).resolve() for e in exclude]
+    entries = status.split("\0")
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if "R" in code or "C" in code:
+            i += 1  # -z puts a rename's source path in the next field
+        full = (top / path).resolve()
+        if not any(full == s or s in full.parents for s in skip):
+            return True
+    return False
 
 
 def _scorer_name(scorer: Any) -> str:
@@ -521,8 +578,14 @@ def run_suite(
     write: bool = True,
     evals_dir: Path | str | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    dirty: bool | None = None,
 ) -> EvalReport:
-    """Run every case, score it, and (with `write=True`) write results and history."""
+    """Run every case, score it, and (with `write=True`) write results and history.
+
+    `dirty` (uncommitted changes) is checked before the first case runs, unless given;
+    the eval and data dirs, which a run writes to, don't count."""
+    if dirty is None:
+        dirty = _run_dirty(evals_dir)
     cap = max_usd if max_usd is not None else suite.max_usd
     cap = settings.eval_max_usd() if cap is None else cap
     started = now()
@@ -582,10 +645,16 @@ def run_suite(
         pass_rate=round(sum(r.passed for r in scored) / len(scored), 6) if scored else 0.0,
         scores=scores,
         cases=results,
+        dirty=dirty,
     )
     if write:
         write_report(report, evals_dir=evals_dir)
     return report
+
+
+def _run_dirty(evals_dir: Path | str | None) -> bool | None:
+    base = Path(evals_dir) if evals_dir is not None else settings.evals_dir()
+    return git_dirty(exclude=[base, settings.data_dir()])
 
 
 def run_suites(
@@ -607,6 +676,7 @@ def run_suites(
     (every case skipped, `budget_exhausted`), so the history shows it didn't run.
     """
     total = settings.eval_total_max_usd() if total_max_usd is None else total_max_usd
+    dirty = _run_dirty(evals_dir)  # once, before any suite writes results
     spent = 0.0
     reports = []
     for suite in suites:
@@ -615,7 +685,13 @@ def run_suites(
         if total is not None:
             cap = max(min(cap, total - spent), 0.0)
         report = run_suite(
-            suite, max_usd=cap, llm_client=llm_client, write=write, evals_dir=evals_dir, now=now
+            suite,
+            max_usd=cap,
+            llm_client=llm_client,
+            write=write,
+            evals_dir=evals_dir,
+            now=now,
+            dirty=dirty,
         )
         spent += report.usd
         reports.append(report)
@@ -809,6 +885,15 @@ def comparisons_markdown(comparisons: Sequence[Comparison]) -> str:
                 f" (prompt `{c.previous.get('prompt_version')}`); regression threshold"
                 f" {c.threshold:.3f}."
             )
+            lines.append("")
+        if cur.get("dirty"):
+            lines.append(
+                f"> ⚠️ Run on uncommitted changes on top of `{str(cur.get('git_sha', ''))[:10]}`,"
+                " so these scores may not match that commit."
+            )
+            lines.append("")
+        if c.previous is not None and c.previous.get("dirty"):
+            lines.append("> ⚠️ The previous entry was also run on uncommitted changes.")
             lines.append("")
         if cur.get("budget_exhausted"):
             lines.append(

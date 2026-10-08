@@ -11,10 +11,12 @@ Four repos depend on it: `real-estate-agent`, `fed-agent`, `sam-agent`, and
 `repo-maintain-agent` (all under `Kghaffari26`).
 
 > **Tag note:** the install line and the reusable workflows' `uses:` lines
-> below pin `@v0.3.1`. That tag needs to exist on this repo (`git tag
-> v0.3.1 && git push origin v0.3.1`, done by a human, not by an agent) before
-> they will resolve — until then, pin to `@v0.2.0` or a commit SHA. Upgrading?
-> See [Migrating from v0.2.0](#migrating-from-v020),
+> below pin `@v0.3.2`. That tag needs to exist on this repo (`git tag
+> v0.3.2 && git push origin v0.3.2`, done by a human, not by an agent) before
+> they will resolve — until then, pin to `@v0.3.1` or a commit SHA. Upgrading?
+> See [Migrating from v0.3.1](#migrating-from-v031),
+> [Migrating from v0.3.0](#migrating-from-v030),
+> [Migrating from v0.2.0](#migrating-from-v020),
 > [Migrating from v0.1.0](#migrating-from-v010) and
 > [CHANGELOG.md](CHANGELOG.md).
 
@@ -69,13 +71,13 @@ read and act on. Every design choice follows from that:
 dependencies = ["agents-core"]
 
 [tool.uv.sources]
-agents-core = { git = "https://github.com/Kghaffari26/agents-core", tag = "v0.3.1" }
+agents-core = { git = "https://github.com/Kghaffari26/agents-core", tag = "v0.3.2" }
 ```
 
 or from the command line:
 
 ```bash
-uv add "agents-core @ git+https://github.com/Kghaffari26/agents-core@v0.3.1"
+uv add "agents-core @ git+https://github.com/Kghaffari26/agents-core@v0.3.2"
 ```
 
 ### Register your agent
@@ -190,6 +192,15 @@ result = ctx.llm.structured(
   model; every int/float in it counts, recursively. Terms that look like
   numbers but aren't facts (`"S&P 500"`, a fixed `"2%"` target) go in
   `allow=`.
+- **The guard matches values, not provenance**: a computed "4.3 times income"
+  passes if 4.3 happens to be some other fact. Pass `no_multiples=True` to
+  `text_guard`/`fields_guard`/`verify_numbers` to also reject multiples and
+  ratios the model computed — "4.3 times", "3x", "2-fold", "three times",
+  "twice", "doubled", "half as", "3:1", "3-to-1", "a ratio of 2.5". They're
+  listed in `GuardResult.unsupported` and `.derived`, and the retry tells the
+  model to state both figures instead (`guards.retry_instruction`). A multiple
+  your data really contains goes in `allow=`. It's opt-in because it also
+  flags innocent phrases ("12 times a year").
 - A failing output is retried once, with the unsupported numbers named in the
   retry. A second failure calls your `fallback()` and returns its result.
   Every failure is logged to `data/guard_failures.jsonl`, and the retry
@@ -340,8 +351,11 @@ without a `ctx`.)
 - `ctx.http.download(url, dest)` streams a large file to disk with a
   conditional GET (ETag/Last-Modified kept in `<dest>.meta.json`), bypassing
   the JSON cache. It returns `DownloadResult(path, modified, status, etag,
-  last_modified, bytes)`; `modified=False` means a 304 and `dest` still holds
-  the previous download.
+  last_modified, bytes, headers)`; `modified=False` means a 304 and `dest`
+  still holds the previous download. `headers` are that response's headers
+  (lower-cased; `set-cookie` dropped), on a 304 too — rate-limit headers,
+  `Link` pagination — and `result.links` parses `Link` into `{rel: url}`
+  (`http.parse_link_header` does the same for any value).
 
 ### The agent loop
 
@@ -555,8 +569,15 @@ uv run agents-evals compare --threshold 0.05     # exit 1 on a regression
   tier's setting; a small `max_tokens` shrinks the judge's worst-case pre-call
   estimate against the spend cap). Any `(case, out, ectx) -> Score` callable with a
   `name` works too.
+- **What the judge sees.** The prompt shows the rubric, the task input, the
+  reference (`case.expected`, narrowed by `expected=`) and the output
+  (narrowed by `output=`). The task input is `case.input`, or — when the
+  task rebuilt it, so the model saw something other than the fixture — the
+  `input` the task returned in `EvalOutput(output, loop=..., input=...)`;
+  `LLMJudge(input=...)` (a dotted path or a callable) narrows either one, so
+  the judge grades against the numbers the model actually had.
 - **Judge calibration.** `judge.calibrate(llm, [LabeledExample(case, output,
-  human_score), ...])` returns agreement, mean absolute error, bias and
+  human_score, input=None), ...])` returns agreement, mean absolute error, bias and
   correlation against human labels; check `report.ok()` before trusting a
   judge, and pass `adjust=report.offset_adjust()` (or any `float -> float`)
   to correct a constant bias.
@@ -575,7 +596,13 @@ uv run agents-evals compare --threshold 0.05     # exit 1 on a regression
   latest report per suite, every case's scores) and appends one line per suite
   to `evals/history.jsonl`: `ts`, `suite`, `prompt_version`, `git_sha`,
   `model`, `scores`, `pass_rate`, `usd`, `n_cases`, `n_scored`,
-  `budget_exhausted`. Commit the history file; it's the baseline.
+  `budget_exhausted`, `dirty`. Commit the history file; it's the baseline.
+- **Uncommitted changes.** `git_sha` is `HEAD`, so a run on an edited tree is
+  attributed to the commit underneath; `dirty: true` marks it (`null` without
+  git), and `compare`'s summary warns. It's checked once, before the first
+  case runs, and counts staged or unstaged changes to tracked files outside
+  the evals dir and `data/` (which the run itself writes); untracked files
+  don't count. `AGENTS_CORE_GIT_DIRTY=true|false` overrides the check.
 - **Compare.** `agents-evals compare` compares each suite's latest history
   entry with its previous one and prints (or `--markdown FILE` appends) a
   table of score deltas; any score (or `pass_rate`) that drops by more than
@@ -656,7 +683,7 @@ jobs:
   run:
     permissions:
       contents: write   # required
-    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
+    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.2
     with:
       agent: real_estate
       max_run_usd: "0.50"
@@ -698,13 +725,13 @@ jobs:
   report:
     if: vars.APPLY_CHANGES != 'true'
     permissions: { contents: write, issues: read, pull-requests: read }
-    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
+    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.2
     with: { agent: repo_maint }
     secrets: inherit
   apply:
     if: vars.APPLY_CHANGES == 'true'
     permissions: { contents: write, issues: write, pull-requests: read }
-    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
+    uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.2
     with: { agent: repo_maint, apply_changes: true, extra_args: --apply }
     secrets: inherit
 ```
@@ -729,7 +756,7 @@ jobs:
   evals:
     permissions:
       contents: read
-    uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.1
+    uses: Kghaffari26/agents-core/.github/workflows/run-evals.yml@v0.3.2
     with:
       eval_command: uv run agents-evals run fed_agent.evals:SUITE
       max_usd: "1.00"               # AGENTS_CORE_EVAL_MAX_USD
@@ -918,6 +945,26 @@ loop](#the-agent-loop), and call `run-agent.yml` on a schedule and
 | `agents_core.settings` | `data_dir()`/`publish_dir()`/`evals_dir()` and every other configurable path; `config/models.toml` loading. |
 
 None of these assume a particular website's layout or a fixed set of agents.
+
+## Migrating from v0.3.1
+
+v0.3.2 is additive: every v0.3.1 call still works, and `latest.json`, `meta` and
+the data-branch files are unchanged.
+
+1. **Bump the pin** to `v0.3.2` in `pyproject.toml` and `uv lock`, and in your
+   workflows' `uses: ...run-agent.yml@v0.3.2` / `run-evals.yml@v0.3.2`.
+2. **Eval history lines gain `dirty`** (`true`/`false`/`null`); older lines
+   without it still compare. A tool that reads `history.jsonl` strictly needs
+   to accept the key.
+3. **Optional, replacing local workarounds:**
+   - a `finish` validator or regex that rejects "N times" →
+     `fields_guard(..., no_multiples=True)` (real-estate-agent's
+     `InvestigationDraft` check);
+   - page-number pagination for conditional reads → `DownloadResult.links`
+     / `.headers` (repo-maintain-agent);
+   - rebuilding `case.input` so the judge sees what the loop saw → return
+     `EvalOutput(output, loop=result, input=seen)` and/or
+     `LLMJudge(input=...)` (fed-agent).
 
 ## Migrating from v0.3.0
 

@@ -21,6 +21,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -95,7 +96,11 @@ class HostPolicy:
 @dataclass(frozen=True)
 class DownloadResult:
     """Result of `Http.download`. `modified` is False when the server answered 304 and
-    `path` still holds the previous download."""
+    `path` still holds the previous download.
+
+    `headers` are this response's headers (lower-cased names; `set-cookie` dropped), on a
+    304 too — e.g. rate-limit headers or `Link` pagination; `links` parses `Link` into
+    `{rel: url}`."""
 
     path: Path
     modified: bool
@@ -103,6 +108,30 @@ class DownloadResult:
     etag: str | None
     last_modified: str | None
     bytes: int
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def links(self) -> dict[str, str]:
+        return parse_link_header(self.headers.get("link", ""))
+
+
+_LINK = re.compile(r"<([^>]*)>((?:\s*;\s*[^;,]+)*)")
+_LINK_REL = re.compile(r"""\brel\s*=\s*"?([^";]+)"?""", re.IGNORECASE)
+
+
+def parse_link_header(value: str) -> dict[str, str]:
+    """`<https://...?page=2>; rel="next", <...>; rel="last"` -> {"next": ..., "last": ...}."""
+    links: dict[str, str] = {}
+    for m in _LINK.finditer(value or ""):
+        rel = _LINK_REL.search(m.group(2))
+        if rel:
+            for name in rel.group(1).split():
+                links.setdefault(name.lower(), m.group(1))
+    return links
+
+
+def _response_headers(r: httpx.Response) -> dict[str, str]:
+    return {k.lower(): v for k, v in r.headers.items() if k.lower() != "set-cookie"}
 
 
 @dataclass
@@ -330,6 +359,7 @@ class Http:
                         etag=prior.get("etag"),
                         last_modified=prior.get("last_modified"),
                         bytes=dest.stat().st_size,
+                        headers=_response_headers(r),
                     )
                 self._raise_for_status(r, "GET", safe_url)
                 size = 0
@@ -350,6 +380,7 @@ class Http:
                     etag=etag,
                     last_modified=last_modified,
                     bytes=size,
+                    headers=_response_headers(r),
                 )
 
         with tracing.span("http", f"GET {host}", method="GET", url=safe_url, download=True) as sp:

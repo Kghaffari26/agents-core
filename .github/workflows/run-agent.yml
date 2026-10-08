@@ -13,7 +13,7 @@
 #       permissions:
 #         contents: write        # always: commits data/, pushes the data branch
 #         issues: write          # only if the agent opens ops alerts or edits issues
-#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.1
+#       uses: Kghaffari26/agents-core/.github/workflows/run-agent.yml@v0.3.2
 #       with:
 #         agent: macro
 #         site_repo: Kghaffari26/agents-hub   # optional

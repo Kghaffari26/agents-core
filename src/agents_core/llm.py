@@ -46,7 +46,8 @@ from pydantic import BaseModel, ValidationError
 
 from agents_core import settings, tracing
 from agents_core.costs import CostTracker, SpendScope, Tier, Usage, usd_for
-from agents_core.guards import GuardResult
+from agents_core.guards import RETRY_INSTRUCTION as RETRY_INSTRUCTION  # re-export (v0.3.1 API)
+from agents_core.guards import GuardResult, retry_instruction
 from agents_core.schema import NarrativeSource, iso_z
 
 log = logging.getLogger(__name__)
@@ -88,11 +89,6 @@ class GuardFailed(LLMError):
 
 class BatchTimeout(LLMError):
     """A batch didn't end within `timeout_seconds` (it has been cancelled)."""
-
-
-RETRY_INSTRUCTION = (
-    "These numbers are not in the input: [{tokens}]. Rewrite using only numbers provided."
-)
 
 
 @dataclass(frozen=True)
@@ -585,7 +581,7 @@ class LLM:
                 {"role": "assistant", "content": self._as_text(first)},
                 {
                     "role": "user",
-                    "content": RETRY_INSTRUCTION.format(tokens=", ".join(result.unsupported)),
+                    "content": retry_instruction(result),
                 },
             ],
         }

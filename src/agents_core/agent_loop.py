@@ -90,8 +90,8 @@ from pydantic import BaseModel, ValidationError
 
 from agents_core import tracing
 from agents_core.costs import BudgetExceeded, ScopeBudgetExceeded, SpendScope, Tier
-from agents_core.guards import GuardResult
-from agents_core.llm import LLM, RETRY_INSTRUCTION, Turn
+from agents_core.guards import GuardResult, retry_instruction
+from agents_core.llm import LLM, Turn
 from agents_core.schema import NarrativeSource
 
 FINISH_TOOL = "finish"
@@ -600,9 +600,7 @@ class AgentLoop[R: BaseModel]:
             check.unsupported,
         )
         if state.guard_attempts <= self.guard_retries:
-            results.append(
-                self._error(use, RETRY_INSTRUCTION.format(tokens=", ".join(check.unsupported)))
-            )
+            results.append(self._error(use, retry_instruction(check)))
             return None
         if self.fallback is not None:
             state.guard_outcome = "fallback"

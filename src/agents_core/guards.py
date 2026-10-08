@@ -21,6 +21,15 @@ Ignored: years 1900-2100, day numbers after a month name, numeric dates, clock t
 ordinals, fixed terms (2-year, 3-month, 52-week, Q1-Q4, 401(k), P0-P3), version strings,
 and anything passed in `allow`.
 
+Values, not provenance: a computed "4.3 times" passes when 4.3 happens to be some
+other fact. Pass `no_multiples=True` (to `verify_numbers`, `text_guard` or
+`fields_guard`) to also reject derived comparisons the model computed itself —
+multiples ("4.3 times", "3x", "2-fold", "twice", "doubled", "half as"), and ratios
+("3:1", "3-to-1", "a ratio of 2.5"). Those phrases are listed in `unsupported` and in
+`derived`, and `retry_instruction()` tells the model to state both figures instead.
+A multiple your data really contains (a computed `price_to_income` you want quoted)
+goes in `allow=` like any other exempt term.
+
 `llm.complete`/`llm.structured` take a guard (see `text_guard` and `fields_guard`) and
 retry once, then fall back to a template, when it fails.
 """
@@ -101,7 +110,60 @@ class NumberToken:
 @dataclass(frozen=True)
 class GuardResult:
     ok: bool
+    # Every failing token: unsupported numbers, then (with no_multiples) derived phrases.
     unsupported: list[str] = field(default_factory=list)
+    # The multiples/ratios among `unsupported` (only with no_multiples=True).
+    derived: list[str] = field(default_factory=list)
+
+
+RETRY_INSTRUCTION = (
+    "These numbers are not in the input: [{tokens}]. Rewrite using only numbers provided."
+)
+DERIVED_RETRY_INSTRUCTION = (
+    "Don't compute multiples or ratios ([{phrases}]); state both figures instead."
+)
+
+
+def retry_instruction(result: GuardResult) -> str:
+    """The message sent with a guard retry, naming what failed."""
+    numbers = [t for t in result.unsupported if t not in result.derived]
+    parts = []
+    if numbers or not result.derived:
+        parts.append(RETRY_INSTRUCTION.format(tokens=", ".join(numbers)))
+    if result.derived:
+        parts.append(DERIVED_RETRY_INSTRUCTION.format(phrases=", ".join(result.derived)))
+    return " ".join(parts)
+
+
+_NUMBER_WORD = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|a\s+few|several)"
+_DERIVED = re.compile(
+    "|".join(
+        [
+            r"(?<![\w.])\d+(?:\.\d+)?\s*(?:×|x\b|times\b|-?fold\b)",  # 4.3 times, 3x, 2-fold
+            rf"\b{_NUMBER_WORD}[\s-]+(?:times|fold)\b",  # three times, two-fold
+            r"\b(?:twice|thrice|doubl(?:e[ds]?|ing)|tripl(?:e[ds]?|ing)|quadrupl(?:e[ds]?|ing)"
+            r"|halv(?:e[ds]?|ing))\b",
+            r"\b(?:half|a\s+third|one[\s-]third|a\s+quarter|one[\s-]quarter)\s+(?:as|of)\b",
+            r"(?<![\w.:])\d+(?:\.\d+)?\s*(?::|-to-)\s*1\b(?![.:]\d)",  # 3:1, 3-to-1
+            r"\bratio\s+of\s+(?:about\s+|roughly\s+|nearly\s+)?\d+(?:\.\d+)?",
+        ]
+    ),
+    re.IGNORECASE,
+)
+
+
+def find_derived(text: str, *, allow: Iterable[str] = ()) -> list[str]:
+    """Multiples and ratios in `text` (see the module docstring), in order, deduplicated.
+    Terms in `allow` are exempt."""
+    allowed = _allow_pattern(allow)
+    if allowed is not None:
+        text = _mask(text, allowed)
+    found: list[str] = []
+    for m in _DERIVED.finditer(text):
+        phrase = " ".join(m.group(0).split())
+        if phrase not in found:
+            found.append(phrase)
+    return found
 
 
 def collect_numbers(obj: Any) -> list[float]:
@@ -213,14 +275,20 @@ def _matches(token: NumberToken, facts: Sequence[float]) -> bool:
     return False
 
 
-def verify_numbers(text: str, facts: Any, *, allow: Iterable[str] = ()) -> GuardResult:
-    """Check every number in `text` against `facts` (numbers or any nested structure)."""
+def verify_numbers(
+    text: str, facts: Any, *, allow: Iterable[str] = (), no_multiples: bool = False
+) -> GuardResult:
+    """Check every number in `text` against `facts` (numbers or any nested structure).
+    With `no_multiples`, multiples and ratios fail too, whatever their numbers."""
+    allow = tuple(allow)
     fact_values = facts if _is_float_list(facts) else collect_numbers(facts)
     unsupported: list[str] = []
     for token in extract_numbers(text, allow=allow):
         if not _matches(token, fact_values) and token.raw not in unsupported:
             unsupported.append(token.raw)
-    return GuardResult(ok=not unsupported, unsupported=unsupported)
+    derived = find_derived(text, allow=allow) if no_multiples else []
+    unsupported += [d for d in derived if d not in unsupported]
+    return GuardResult(ok=not unsupported, unsupported=unsupported, derived=derived)
 
 
 def _is_float_list(x: Any) -> bool:
@@ -230,15 +298,21 @@ def _is_float_list(x: Any) -> bool:
 # ---- guards for agents_core.llm -----------------------------------------------------
 
 
-def text_guard(facts: Any, *, allow: Iterable[str] = ()) -> Callable[[str], GuardResult]:
+def text_guard(
+    facts: Any, *, allow: Iterable[str] = (), no_multiples: bool = False
+) -> Callable[[str], GuardResult]:
     """Guard for `llm.complete`: checks the whole returned text."""
     values = collect_numbers(facts)
     allow = tuple(allow)
-    return lambda text: verify_numbers(text, values, allow=allow)
+    return lambda text: verify_numbers(text, values, allow=allow, no_multiples=no_multiples)
 
 
 def fields_guard(
-    facts: Any, fields: Sequence[str], *, allow: Iterable[str] = ()
+    facts: Any,
+    fields: Sequence[str],
+    *,
+    allow: Iterable[str] = (),
+    no_multiples: bool = False,
 ) -> Callable[[Any], GuardResult]:
     """Guard for `llm.structured`: checks only the named narrative fields.
 
@@ -251,7 +325,7 @@ def fields_guard(
 
     def guard(output: Any) -> GuardResult:
         text = "\n".join(_strings_at(output, fields))
-        return verify_numbers(text, values, allow=allow)
+        return verify_numbers(text, values, allow=allow, no_multiples=no_multiples)
 
     return guard
 

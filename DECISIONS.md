@@ -85,3 +85,18 @@ One line per judgment call, newest release first.
 - Dirty-tree attribution deferred specifically because the eval run itself writes tracked files (`evals/results/*.json`, `history.jsonl`), so a naive dirty check would split one run's suites across two "SHAs" and break `compare`'s same-SHA grouping.
 - Doc pins moved to `@v0.3.1` (README install lines and workflow examples, run-agent.yml/run-evals.yml headers, CLAUDE.md); historical "Migrating from" sections keep their versions.
 - Pushed to `main` as instructed (and to the session branch); no tag created — a human tags v0.3.1.
+
+## v0.3.2
+
+- Scope and shape of each item came from the agent repos' own STATUS.md (cloned read-only): real-estate-agent's "4.3 times" case study and its `_MULTIPLE` finish validator, repo-maintain-agent's rate-limit/`Link` pagination need, fed-agent's "judge grades against the fixture, not what the loop saw", sam-agent's dirty-tree attribution.
+- `no_multiples` is opt-in (default False) so existing guards behave exactly as before; it flags phrases like "12 times a year" too, which is acceptable only when an agent chooses it, and `allow=` exempts a multiple the data really holds.
+- Derived phrases go into `GuardResult.unsupported` (so every existing consumer — fallbacks, logs, `Guarded.unsupported`, trace spans — treats them as failures) and also into a new `derived` list so the retry message can say why; with no derived phrases the retry text is byte-for-byte the v0.3.1 `RETRY_INSTRUCTION`.
+- The multiples pattern covers real-estate-agent's validator (N times/x, twice/double/triple, number-word times) plus -fold, ×, doubled/halved forms, "half/a third as|of", "N:1"/"N-to-1" and "ratio of N"; "N to 1" with spaces is excluded because "rose from 3 to 1..." is ordinary prose, and clock times stay masked.
+- `RETRY_INSTRUCTION` moved to `guards` (llm imports guards, not the reverse) and is re-exported from `llm` so v0.3.1 imports keep working.
+- `DownloadResult.headers` defaults to `{}` (frozen dataclass, keyword default) so code constructing it positionally still works; `set-cookie` is dropped like elsewhere in http.py, and the sidecar file is unchanged (headers aren't persisted, only returned).
+- `links` is a property parsing RFC 8288 `Link` (multiple rels per link, quoted or bare); first occurrence of a rel wins.
+- The judge's input comes from `EvalOutput.input` when the task sets it, else `case.input`, then `input=` narrows it — so fed-agent can either have the task report what the loop saw or select part of the fixture; `input=` mirrors `output=`/`expected=` (dotted path or 1-arg callable) rather than taking the whole case, for consistency.
+- `dirty` is a separate field rather than a suffixed SHA (e.g. `abc123-dirty`), because `compare` groups the latest run's suites by exact `git_sha`; a suffix would have changed that grouping and broken baselines.
+- Dirty means staged or unstaged changes to tracked files; untracked files don't count (they're mostly caches and scratch; an untracked new prompt is a gap, documented). The evals dir and `data_dir()` are excluded because a run writes them, and the check runs once per `run_suites` before any suite writes.
+- `AGENTS_CORE_GIT_DIRTY` overrides the check (for CI or wrappers that know better); `null` when git is missing or the CWD isn't a work tree. `compare` only warns on dirty entries — it doesn't fail or skip them.
+- Pushed to `main` (and to the session branch); no tag created — a human tags v0.3.2.
